@@ -1,0 +1,40 @@
+# ROS2 Colcon Build Artifacts
+build/
+install/
+log/
+
+# General Build Artifacts & Compiled Files
+*.o
+*.so
+*.a
+*.dll
+*.dylib
+*.exe
+
+# Python Cache & Virtual Environments
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# IDE and Editor Specific Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+#*#
+*.bak
+*.orig
+.cproject
+.project
+.settings/
+
+# Operating System Specific Files
+.DS_Store
+Thumbs.db
+
+# Other Common Ignored Files
+.env # Environment variables file
+.pytest_cache/ # pytest cache
+.coverage # Python coverage reports

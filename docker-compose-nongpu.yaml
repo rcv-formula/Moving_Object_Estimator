@@ -1,0 +1,25 @@
+# 노트북과 같이 gpu연결을 하지 못하는 경우
+services:
+  f1_fomula_ws:
+    image: f1_fomula:latest
+    container_name: f1_fomula
+    
+    environment:
+      - DISPLAY=${DISPLAY}
+    
+    privileged: true
+    network_mode: host
+    ipc: host
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /dev/video0:/dev/video0
+      - .:/root/moving_object_estimator_ws
+    working_dir: /root/moving_object_estimator_ws
+    
+    # 컨테이너가 시작될 때 자동으로 실행할 명령 (Dockerfile CMD를 오버라이드)
+    # `docker run`의 `--entrypoint` 또는 CMD와 유사
+    command: ["/bin/bash", "-c", "tail -f /dev/null"] 
+
+volumes:
+  f1_fomula:
+    

@@ -1,0 +1,38 @@
+scan_processor_node:
+  ros__parameters:
+    # 스캔 데이터 필터링 파라미터
+    scan_range_min: 0.0            # (m) 레이저 스캔 데이터에서 고려할 최소 거리
+    scan_range_max: 8.0            # (m) 레이저 스캔 데이터에서 고려할 최대 거리
+    scan_angle_min: -2.35619       # (rad) 스캔 데이터에서 고려할 최소 각도 (-π/2 ≒ -1.5708 rad)
+    scan_angle_max: 2.35619         # (rad) 스캔 데이터에서 고려할 최대 각도 (π/2 ≒ 1.5708 rad)
+
+    # DBSCAN 클러스터링 관련 파라미터
+    min_cluster_points: 3        # (개) DBSCAN 클러스터링 시 하나의 클러스터로 인식하기 위한 최소 점 개수
+    dbscan_epsilon: 0.03           # (m) 두 점 사이의 최대 거리 기준 (eps 값)
+    dbscan_max_points: 100         # (개) DBSCAN 클러스터링 시 하나의 클러스터로 인식하기 위한 최대 점 개수
+
+    # 벽 필터링 관련 파라미터
+    wall_distance_threshold: 0.06  # (m) 연속된 스캔 점 사이의 최대 거리 – 이 값 이하이면 같은 그룹으로 묶음
+    wall_line_max_error: 0.005     # (m) 그룹 내 점들을 직선으로 근사할 때 허용하는 최대 오차
+    min_wall_cluster_points: 6     # (개) 벽으로 판단하기 위한 그룹 내 최소 점 개수
+    wall_length_threshold: 0.35    # (m) 그룹 선분 길이가 이 값보다 크면 벽으로 간주
+
+    # 멀리 있는 장애물 필터링 관련 파라미터
+    far_obstacle_distance_threshold: 4.5  # (m) 센서로부터의 거리가 이 값 이상이면 '멀리 있는 장애물'로 판단
+    far_obstacle_min_points: 12            # (개) 멀리 있는 장애물로 인식하기 위한 최소 스캔 점 개수
+    dynamic_wall_gap_factor: 2.8           # (가중치) 먼 거리 벽 그룹화를 위한 동적 임계값 배율
+    
+    sor_mean_k: 8
+    sor_stddev_mul: 2.0
+    window_seconds: 0.1
+
+obstacle_detector_node:
+  ros__parameters:
+    dbscan_eps: 0.25                # (m) DBSCAN 함수에서 두 점이 서로 인접하다고 판단하는 최대 거리(증가시 클러스터 크기가 더 커짐)
+    dbscan_min_points: 5           # (개수) DBSCAN에서 하나의 코어로 간주되기 위해 해당 반경 내에 있어야 하는 점 최소 개수 
+    use_weighted_median: true      # () weighted median값을 사용해서 클러스터 내의 대표점을 산출할 지 결정하는 파라미터
+    kalman_process_noise: 0.2      # (m²/s²)칼말 필터의 예측 단계에서 시스템의 불확실성(증가시 필터가 측정치에 민감하게 반응, noise에 민감해져서 요동침)
+    kalman_measurement_noise: 0.05  # (m², m²/s²) 칼만 필터의 업데이트 단계에서 측정치의 노이즈(불확실성)를 나타내는 값
+    use_kalman_filter: true        # () kalman filter 적용 여부
+    obstacle_timeout: 0.03          # (초) 이 시간동안 측정값이 없으면 장애물 없음으로 간주
+    
