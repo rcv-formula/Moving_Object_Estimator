@@ -24,7 +24,7 @@ scan_processor_node:
     
     sor_mean_k: 8
     sor_stddev_mul: 2.0
-    window_seconds: 0.1
+    window_seconds: 0.25
 
 obstacle_detector_node:
   ros__parameters:

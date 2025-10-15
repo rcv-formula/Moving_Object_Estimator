@@ -55,6 +55,7 @@ class AirIoImuOdomNode(Node):
         self.declare_parameter("airio_every", 3)
         self.declare_parameter("timming_logging_mode", False)
         self.declare_parameter("timming_logging_outputpath", ".")
+        # self.declare_parameter('use_sim_time', True)
 
         airimu_root = self.get_parameter("airimu_root").get_parameter_value().string_value
         airimu_ckpt = self.get_parameter("airimu_ckpt").get_parameter_value().string_value
@@ -102,6 +103,9 @@ class AirIoImuOdomNode(Node):
         self._pp_acc = None  # shape [1,1,3], float32
 
         # --- Subs & Pubs ---
+
+        self._wait_for_sim_time(timeout_sec=5.0)
+            
         self.create_subscription(
             Imu, '/imu/data_raw', self.imu_callback,
             qos_profile_sensor_data, callback_group=self.cbgroup_imu
@@ -153,6 +157,23 @@ class AirIoImuOdomNode(Node):
         self._last_ego_pos = np.zeros(3, dtype=float)
 
     # --- 내부 유틸 ---
+    def _wait_for_sim_time(self, timeout_sec: float = 5.0):
+        """
+        use_sim_time=True 가정. /clock 기반 시간이 유효해질 때까지 대기.
+        timeout_sec 내에 유효해지지 않으면 경고 로그만 남기고 진행한다.
+        """
+        start = time.time()
+        # now()==0 인 동안 대기
+        while rclpy.ok() and self.get_clock().now().nanoseconds == 0:
+            # 50ms 단위로 spin_once (콜백/파라미터 이벤트 처리)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if timeout_sec is not None and (time.time() - start) > timeout_sec:
+                self.get_logger().warn(
+                    f"Sim time(/clock) not available after {timeout_sec:.1f}s. "
+                    "Continuing anyway — check 'ros2 topic echo /clock' and rosbag '--clock'."
+                )
+                break
+            
     def _prepare_pp_buffers(self):
         """IMUPreintegrator 입력 버퍼를 device/float32로 사전할당."""
         self._pp_dt  = torch.zeros((1, 1, 1), dtype=torch.float32, device=self.pp_dev)

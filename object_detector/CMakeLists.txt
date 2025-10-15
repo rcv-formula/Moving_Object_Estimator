@@ -43,6 +43,7 @@ ament_target_dependencies(scan_processor_node
   tf2_geometry_msgs
   visualization_msgs
   pcl_conversions
+  nav_msgs
   Eigen3
 )
 
