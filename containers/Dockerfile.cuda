@@ -1,0 +1,45 @@
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      locales software-properties-common curl gnupg lsb-release \
+      build-essential cmake git \
+      libglvnd0 libgl1 libglx0 libegl1 libxext6 libx11-6 \
+  && echo "en_US.UTF-8 UTF-8" > /etc/locale.gen \
+  && locale-gen en_US.UTF-8 \
+  && /usr/sbin/update-locale LANG=en_US.UTF-8 \
+  && curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+       -o /usr/share/keyrings/ros-archive-keyring.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
+      http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
+      > /etc/apt/sources.list.d/ros2.list \
+  && rm -rf /var/lib/apt/lists/*
+
+ENV LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8" LANGUAGE="en_US.UTF-8"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ros-humble-desktop \
+      ros-dev-tools \
+      # ros-humble-tiago-gazebo \
+      python3-colcon-common-extensions python3-flake8 python3-pip \
+      python3-pytest-cov python3-rosdep python3-setuptools python3-vcstool \
+      wget python3-argcomplete libasio-dev libtinyxml2-dev libcunit1-dev \
+      libbullet-dev \
+  && rm -rf /var/lib/apt/lists/* \
+  && rosdep init || true && rosdep update
+
+COPY configs/bashrc_config.txt /tmp/bashrc_config_temp.txt
+
+RUN cat /tmp/bashrc_config_temp.txt >> /root/.bashrc && \
+    rm /tmp/bashrc_config_temp.txt # 임시 파일 삭제
+
+WORKDIR /moving_object_estimator_ws
+COPY . .
+RUN apt-get update \
+  && rosdep install --from-paths airio_imu_odometry object_detector --ignore-src -r -y \
+  && rm -rf /var/lib/apt/lists/*
+
+CMD ["bash"]

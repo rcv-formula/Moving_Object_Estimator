@@ -1,0 +1,23 @@
+# 노트북과 같이 gpu연결을 하지 못하는 경우
+services:
+  f1_fomula_ws:
+    build:
+      context: .
+      dockerfile: containers/Dockerfile.nogpu
+    image: mos:nogpu
+    container_name: mos_desktop
+    runtime: nvidia
+    environment:
+      - DISPLAY=${DISPLAY}
+
+    privileged: true
+    network_mode: host
+    ipc: host
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /dev/video0:/dev/video0
+      - .:/root/moving_object_estimator_ws
+    working_dir: /root/moving_object_estimator_ws
+
+    # 개발 컨테이너 유지용(운영 시 제거)
+    command: ["/bin/bash", "-c", "tail -f /dev/null"]
