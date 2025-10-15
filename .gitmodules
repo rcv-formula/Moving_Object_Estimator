@@ -1,3 +1,6 @@
-[submodule "moving_object_estimator/external/Air-IO-for-Damvi"]
-	path = moving_object_estimator/external/Air-IO-for-Damvi
+[submodule "airio_imu_odometry/external/AirIMU-for-Damvi"]
+	path = airio_imu_odometry/external/AirIMU-for-Damvi
+	url = https://github.com/bottle-an00/AirIMU-for-Damvi.git
+[submodule "airio_imu_odometry/external/Air-IO-for-Damvi"]
+	path = airio_imu_odometry/external/Air-IO-for-Damvi
 	url = https://github.com/bottle-an00/Air-IO-for-Damvi.git
