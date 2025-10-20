@@ -54,6 +54,7 @@ ENV LANG="en_US.UTF-8" \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-desktop \
     ros-dev-tools \
+    ros-humble-rmw-cyclonedds-cpp \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rosdep init && rosdep update
