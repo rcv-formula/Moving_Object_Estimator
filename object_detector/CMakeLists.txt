@@ -1,10 +1,24 @@
 cmake_minimum_required(VERSION 3.5)
 project(object_detector)
 
-# C++ 표준 (필요시 14 이상으로 설정)
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 17)
 endif()
+
+if(POLICY CMP0144)
+  cmake_policy(SET CMP0144 OLD)
+endif()
+if(POLICY CMP0167)
+  cmake_policy(SET CMP0167 OLD)
+endif()
+if(POLICY CMP0074)
+  cmake_policy(SET CMP0074 OLD)
+endif()
+
+find_package(MPI REQUIRED C CXX)     # 반드시 PCL/VTK보다 먼저
+find_package(PCL REQUIRED COMPONENTS common io filters visualization)  # 필요한 컴포넌트
+
+set(CMAKE_DISABLE_FIND_PACKAGE_MPI ON)
 
 # ament_cmake 및 의존 패키지 찾기
 find_package(ament_cmake REQUIRED)
