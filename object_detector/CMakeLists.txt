@@ -1,24 +1,18 @@
 cmake_minimum_required(VERSION 3.5)
 project(object_detector)
 
-if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 17)
-endif()
+# === MPI 설정 (깨진 HPCX 경로 회피, 시스템 OpenMPI 고정) ===
+# 필요 시 조건문으로 감싸도 됨.
+set(MPI_C_COMPILER "/usr/bin/mpicc" CACHE FILEPATH "MPI C compiler path")
+set(MPI_CXX_COMPILER "/usr/bin/mpicxx" CACHE FILEPATH "MPI C++ compiler path")
+set(MPI_HOME "/usr/lib/aarch64-linux-gnu/openmpi" CACHE PATH "MPI home path")
+set(CMAKE_IGNORE_PREFIX_PATH "/opt/hpcx" CACHE PATH "Ignore broken HPCX path")
 
-if(POLICY CMP0144)
-  cmake_policy(SET CMP0144 OLD)
-endif()
-if(POLICY CMP0167)
-  cmake_policy(SET CMP0167 OLD)
-endif()
-if(POLICY CMP0074)
-  cmake_policy(SET CMP0074 OLD)
-endif()
+find_package(MPI REQUIRED COMPONENTS C CXX)
+include_directories(${MPI_C_INCLUDE_PATH})
 
-find_package(MPI REQUIRED C CXX)     # 반드시 PCL/VTK보다 먼저
-find_package(PCL REQUIRED COMPONENTS common io filters visualization)  # 필요한 컴포넌트
+find_package(PCL REQUIRED COMPONENTS common io filters visualization)  
 
-set(CMAKE_DISABLE_FIND_PACKAGE_MPI ON)
 
 # ament_cmake 및 의존 패키지 찾기
 find_package(ament_cmake REQUIRED)
