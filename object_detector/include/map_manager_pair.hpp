@@ -5,6 +5,7 @@
 #include <memory>
 #include <utility>
 #include <algorithm>
+#include <optional>
 
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/pose.hpp>
@@ -17,96 +18,206 @@
 
 #include <Eigen/Dense>
 
+/**
+ * @brief Manages temporal collections of point clouds and detected objects with pose information
+ * 
+ * This class maintains sliding window buffers for:
+ * - Point clouds (with and without pose)
+ * - Detected objects (with and without pose)
+ */
 class MapManager {
 public:
   using Cloud = pcl::PointCloud<pcl::PointXYZI>;
   using CloudPtr = typename Cloud::Ptr;
+  using CloudConstPtr = typename Cloud::ConstPtr;
+  
+  using PointVector = std::vector<geometry_msgs::msg::PointStamped>;
+  using CloudPosePair = std::pair<CloudPtr, geometry_msgs::msg::Pose>;
+  using ObjectPosePair = std::pair<PointVector, geometry_msgs::msg::Pose>;
 
+  /**
+   * @brief Simple 3D point structure
+   */
   struct PointXYZ {
-    float x{0.f}, y{0.f}, z{0.f};
+    float x{0.0f};
+    float y{0.0f};
+    float z{0.0f};
   };
 
-  explicit MapManager(size_t max_deque = 100)
-  : max_deque_size_(max_deque) {}
+  /**
+   * @brief Construct a new Map Manager
+   * @param max_deque Maximum number of elements to store in each buffer
+   */
+  explicit MapManager(size_t max_deque = 100) noexcept
+    : max_deque_size_(max_deque) {}
 
-  void set_max_deque_size(size_t n) { max_deque_size_ = n; trim_(); }
-  size_t max_deque_size() const { return max_deque_size_; }
+  // Prevent copying, allow moving
+  MapManager(const MapManager&) = delete;
+  MapManager& operator=(const MapManager&) = delete;
+  MapManager(MapManager&&) noexcept = default;
+  MapManager& operator=(MapManager&&) noexcept = default;
+  
+  ~MapManager() = default;
 
-  static Eigen::Matrix4d poseToMatrix(const geometry_msgs::msg::Pose& p) {
-    Eigen::Quaterniond q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
-    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-    T.block<3,3>(0,0) = q.normalized().toRotationMatrix();
-    T(0,3) = p.position.x;
-    T(1,3) = p.position.y;
-    T(2,3) = p.position.z;
-    return T;
+  /**
+   * @brief Set maximum buffer size and trim if necessary
+   */
+  void SetMaxDequeSize(size_t size) noexcept {
+    max_deque_size_ = size;
+    TrimBuffers();
+  }
+  
+  [[nodiscard]] size_t GetMaxDequeSize() const noexcept { return max_deque_size_; }
+
+  /**
+   * @brief Convert ROS Pose message to 4x4 transformation matrix
+   */
+  [[nodiscard]] static Eigen::Matrix4d PoseToMatrix(const geometry_msgs::msg::Pose& pose) noexcept {
+    const Eigen::Quaterniond q(
+      pose.orientation.w,
+      pose.orientation.x,
+      pose.orientation.y,
+      pose.orientation.z
+    );
+    
+    Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
+    transform.block<3, 3>(0, 0) = q.normalized().toRotationMatrix();
+    transform(0, 3) = pose.position.x;
+    transform(1, 3) = pose.position.y;
+    transform(2, 3) = pose.position.z;
+    
+    return transform;
   }
 
-  void addCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& msg) {
-    CloudPtr pcl_cloud(new Cloud());
+  /**
+   * @brief Add point cloud without pose information
+   */
+  void AddCloud(const sensor_msgs::msg::PointCloud2::SharedPtr& msg) {
+    if (!msg) return;
+    
+    CloudPtr pcl_cloud = std::make_shared<Cloud>();
     pcl::fromROSMsg(*msg, *pcl_cloud);
-    deque_.push_back(pcl_cloud);
-    trim_();
+    cloud_deque_.push_back(std::move(pcl_cloud));
+    
+    TrimBuffers();
   }
 
-  std::vector<CloudPtr> snapshot_cloud() const {
-    return std::vector<CloudPtr>(deque_.begin(), deque_.end());
+  /**
+   * @brief Get snapshot of all stored clouds
+   */
+  [[nodiscard]] std::vector<CloudPtr> GetCloudSnapshot() const {
+    return {cloud_deque_.begin(), cloud_deque_.end()};
   }
 
-  void addCloudWithPose(const sensor_msgs::msg::PointCloud2::SharedPtr& msg,
-                        const geometry_msgs::msg::Pose& pose) {
-    CloudPtr pcl_cloud(new Cloud());
+  /**
+   * @brief Add point cloud with associated pose
+   */
+  void AddCloudWithPose(
+      const sensor_msgs::msg::PointCloud2::SharedPtr& msg,
+      const geometry_msgs::msg::Pose& pose) {
+    if (!msg) return;
+    
+    CloudPtr pcl_cloud = std::make_shared<Cloud>();
     pcl::fromROSMsg(*msg, *pcl_cloud);
-    deque_pair_.emplace_back(pcl_cloud, pose);
-    trim_();
+    cloud_pose_deque_.emplace_back(std::move(pcl_cloud), pose);
+    
+    TrimBuffers();
   }
 
-  std::vector<std::pair<CloudPtr, geometry_msgs::msg::Pose>> snapshot_pairs() const {
-    return std::vector<std::pair<CloudPtr, geometry_msgs::msg::Pose>>(
-      deque_pair_.begin(), deque_pair_.end());
+  /**
+   * @brief Get snapshot of all cloud-pose pairs
+   */
+  [[nodiscard]] std::vector<CloudPosePair> GetCloudPoseSnapshot() const {
+    return {cloud_pose_deque_.begin(), cloud_pose_deque_.end()};
   }
 
-  void addObj(const std::vector<geometry_msgs::msg::PointStamped>& p) {
-    obj_deque_.push_back(p);
-    trim_();
+  /**
+   * @brief Add detected objects without pose
+   */
+  void AddObjects(const PointVector& points) {
+    object_deque_.push_back(points);
+    TrimBuffers();
   }
 
-  std::vector<std::vector<geometry_msgs::msg::PointStamped>> snapshot_obj() const {
-    std::vector<std::vector<geometry_msgs::msg::PointStamped>> out;
-    out.reserve(obj_deque_.size());
-    for (const auto &c : obj_deque_) out.push_back(c);
-    return out;
+  /**
+   * @brief Get snapshot of all stored objects
+   */
+  [[nodiscard]] std::vector<PointVector> GetObjectSnapshot() const {
+    return {object_deque_.begin(), object_deque_.end()};
   }
 
-  void addObjWithPose(const std::vector<geometry_msgs::msg::PointStamped>& p, const geometry_msgs::msg::Pose& pose) {
-    obj_pair_deque_.emplace_back(p, pose);
-    trim_();
+  /**
+   * @brief Add detected objects with associated pose
+   */
+  void AddObjectsWithPose(
+      const PointVector& points,
+      const geometry_msgs::msg::Pose& pose) {
+    object_pose_deque_.emplace_back(points, pose);
+    TrimBuffers();
   }
 
-  std::vector<std::pair<std::vector<geometry_msgs::msg::PointStamped>, geometry_msgs::msg::Pose>> snapshot_obj_pairs() const {
-    return std::vector<std::pair<std::vector<geometry_msgs::msg::PointStamped>, geometry_msgs::msg::Pose>>(
-      obj_pair_deque_.begin(), obj_pair_deque_.end());
+  /**
+   * @brief Get snapshot of all object-pose pairs
+   */
+  [[nodiscard]] std::vector<ObjectPosePair> GetObjectPoseSnapshot() const {
+    return {object_pose_deque_.begin(), object_pose_deque_.end()};
   }
 
-  size_t size() const {
-    size_t a = deque_.size();
-    size_t b = deque_pair_.size();
-    size_t c = obj_deque_.size();
-    size_t d = obj_pair_deque_.size();
-    return std::max(std::max(a,b), std::max(c,d));
+  /**
+   * @brief Get maximum size across all buffers
+   */
+  [[nodiscard]] size_t Size() const noexcept {
+    return std::max({
+      cloud_deque_.size(),
+      cloud_pose_deque_.size(),
+      object_deque_.size(),
+      object_pose_deque_.size()
+    });
+  }
+
+  /**
+   * @brief Check if all buffers are empty
+   */
+  [[nodiscard]] bool Empty() const noexcept {
+    return cloud_deque_.empty() && 
+           cloud_pose_deque_.empty() && 
+           object_deque_.empty() && 
+           object_pose_deque_.empty();
+  }
+
+  /**
+   * @brief Clear all buffers
+   */
+  void Clear() noexcept {
+    cloud_deque_.clear();
+    cloud_pose_deque_.clear();
+    object_deque_.clear();
+    object_pose_deque_.clear();
   }
 
 private:
-  void trim_() {
-    while (deque_.size() > max_deque_size_) deque_.pop_front();
-    while (deque_pair_.size() > max_deque_size_) deque_pair_.pop_front();
-    while (obj_deque_.size() > max_deque_size_) obj_deque_.pop_front();
-    while (obj_pair_deque_.size() > max_deque_size_) obj_pair_deque_.pop_front();
+  /**
+   * @brief Trim all buffers to maximum size
+   */
+  void TrimBuffers() noexcept {
+    while (cloud_deque_.size() > max_deque_size_) {
+      cloud_deque_.pop_front();
+    }
+    while (cloud_pose_deque_.size() > max_deque_size_) {
+      cloud_pose_deque_.pop_front();
+    }
+    while (object_deque_.size() > max_deque_size_) {
+      object_deque_.pop_front();
+    }
+    while (object_pose_deque_.size() > max_deque_size_) {
+      object_pose_deque_.pop_front();
+    }
   }
 
   size_t max_deque_size_{40};
-  std::deque<CloudPtr> deque_;
-  std::deque<std::vector<geometry_msgs::msg::PointStamped>> obj_deque_;
-  std::deque<std::pair<CloudPtr, geometry_msgs::msg::Pose>> deque_pair_;
-  std::deque<std::pair<std::vector<geometry_msgs::msg::PointStamped>, geometry_msgs::msg::Pose>> obj_pair_deque_;
+  
+  std::deque<CloudPtr> cloud_deque_;
+  std::deque<PointVector> object_deque_;
+  std::deque<CloudPosePair> cloud_pose_deque_;
+  std::deque<ObjectPosePair> object_pose_deque_;
 };

@@ -1,417 +1,741 @@
 #pragma once
+
 #include <vector>
 #include <algorithm>
 #include <cmath>
 #include <memory>
 #include <limits>
+#include <optional>
+#include <array>
 
 #include <geometry_msgs/msg/point_stamped.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/kdtree/kdtree_flann.h>
+#include <rclcpp/rclcpp.hpp>
 
 #include "map_manager_pair.hpp"
 
+/**
+ * @brief Classification result for dynamic obstacle detection
+ */
+enum class ObstacleType {
+  kUnknown = -1,  ///< Could not determine type
+  kStatic = 0,    ///< Static obstacle
+  kDynamic = 1    ///< Dynamic/moving obstacle
+};
+
+/**
+ * @brief Color representation in RGB
+ */
+struct RgbColor {
+  float r{1.0f};
+  float g{1.0f};
+  float b{1.0f};
+  float a{1.0f};
+};
+
+/**
+ * @brief Detects and classifies dynamic objects using footprint analysis
+ * 
+ * This class analyzes historical point cloud data to determine if detected
+ * objects are static or dynamic based on their motion footprint over time.
+ */
 class DynamicObjectDetector {
 public:
+  using PointVector = std::vector<geometry_msgs::msg::PointStamped>;
+  using ObjectPosePair = std::pair<PointVector, geometry_msgs::msg::Pose>;
+  using TransformedFrames = std::vector<PointVector>;
+  using MarkerPublisher = rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr;
+
+  /**
+   * @brief Configuration parameters for the detector
+   */
+  struct Config {
+    double proximity_threshold{0.05};      ///< [m] Very close distance threshold
+    double boundary_threshold{0.1};        ///< [m] Boundary zone upper limit
+    int target_frame_index{5};             ///< Target historical frame index
+    double dbscan_epsilon{0.12};           ///< [m] DBSCAN clustering radius
+    int dbscan_min_points{3};              ///< Minimum points for DBSCAN core
+    double search_radius{0.40};            ///< [m] Candidate search radius
+    double motion_threshold{0.10};         ///< [m] Motion detection threshold (10cm)
+    int min_distinct_frames{5};            ///< Minimum number of distinct frames required
+  };
 
   DynamicObjectDetector() = default;
+  explicit DynamicObjectDetector(const Config& config) noexcept : config_(config) {}
 
-  void set_threshold1(double v)        { threshold1_ = std::max(0.0, v); }
-  void set_threshold2(double v)        { threshold2_ = std::max(0.0, v); }
-  void set_target_frame_idx(int idx)   { target_frame_idx_ = idx; }
+  // Disable copying, allow moving
+  DynamicObjectDetector(const DynamicObjectDetector&) = delete;
+  DynamicObjectDetector& operator=(const DynamicObjectDetector&) = delete;
+  DynamicObjectDetector(DynamicObjectDetector&&) noexcept = default;
+  DynamicObjectDetector& operator=(DynamicObjectDetector&&) noexcept = default;
+  
+  ~DynamicObjectDetector() = default;
 
-  double threshold1() const            { return threshold1_; }
-  double threshold2() const            { return threshold2_; }
-  int    target_frame_idx() const      { return target_frame_idx_; }
+  /**
+   * @brief Set configuration parameters
+   */
+  void SetConfig(const Config& config) noexcept { config_ = config; }
+  [[nodiscard]] const Config& GetConfig() const noexcept { return config_; }
 
-  inline Eigen::Matrix4d poseToMatrix(const geometry_msgs::msg::Pose& p) {
-    Eigen::Quaterniond q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
-    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-    T.block<3,3>(0,0) = q.normalized().toRotationMatrix();
-    T(0,3) = p.position.x;
-    T(1,3) = p.position.y;
-    T(2,3) = p.position.z;
-    return T;
+  /**
+   * @brief Set proximity threshold (clamped to non-negative)
+   */
+  void SetProximityThreshold(double value) noexcept {
+    config_.proximity_threshold = std::max(0.0, value);
   }
 
-  inline std::vector<std::vector<geometry_msgs::msg::PointStamped>>
-  transformObjHistoryToCurrentFrames(
-      const std::vector<std::pair<std::vector<geometry_msgs::msg::PointStamped>, geometry_msgs::msg::Pose>>& deque_snapshot_obj_pairs,
-      const geometry_msgs::msg::Pose& current_pose)
-  {
-    std::vector<std::vector<geometry_msgs::msg::PointStamped>> out;
-    out.reserve(deque_snapshot_obj_pairs.size());
-
-    // current(map) 변환: map->current, so current->map is inverse
-    const Eigen::Matrix4d T_map_curr = poseToMatrix(current_pose);
-    const Eigen::Matrix4d T_curr_map = T_map_curr.inverse();
-
-    for (const auto& pr : deque_snapshot_obj_pairs) {
-      const auto& frame_pts  = pr.first;   // 과거 프레임의 로컬 점들
-      const auto& hist_pose  = pr.second;  // 그 프레임이 찍힐 당시의 pose (map 기준)
-
-      // hist(local) -> map
-      const Eigen::Matrix4d T_map_hist  = poseToMatrix(hist_pose);
-      // hist(local) -> current
-      const Eigen::Matrix4d T_curr_hist = T_curr_map * T_map_hist;
-
-      std::vector<geometry_msgs::msg::PointStamped> frame_out;
-      frame_out.reserve(frame_pts.size());
-
-      for (const auto& ps : frame_pts) {
-        // ps.point 는 "그때의 로컬 프레임" 좌표라고 가정
-        Eigen::Vector4d p_hist(ps.point.x, ps.point.y, ps.point.z, 1.0);
-        Eigen::Vector4d p_curr = T_curr_hist * p_hist;
-
-        geometry_msgs::msg::PointStamped ps_out;
-        ps_out.header.stamp = ps.header.stamp;     // 타임스탬프는 원본 유지(원하면 현재로 바꿔도 무방)
-        // ps_out.header.frame_id 는 여기서 비워두고, 시각화 시 Marker의 frame_id로 지정하는 걸 권장
-        ps_out.point.x = p_curr.x();
-        ps_out.point.y = p_curr.y();
-        ps_out.point.z = p_curr.z();
-
-        frame_out.emplace_back(std::move(ps_out));
-      }
-      out.emplace_back(std::move(frame_out));
-    }
-    return out;
+  /**
+   * @brief Set boundary threshold (clamped to non-negative)
+   */
+  void SetBoundaryThreshold(double value) noexcept {
+    config_.boundary_threshold = std::max(0.0, value);
   }
 
-  inline void publishAlignedFramesMarkers(
-      const std::vector<std::vector<geometry_msgs::msg::PointStamped>> &aligned_frames,
-      const std::string &frame_id,
-      const rclcpp::Time &stamp,
-      const rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr &pub,
-      double point_scale = 0.06,
-      double lifetime_sec = 0.25) const
-  {
-    if (!pub || aligned_frames.empty()) return;
+  /**
+   * @brief Set target frame index for analysis
+   */
+  void SetTargetFrameIndex(int index) noexcept {
+    config_.target_frame_index = index;
+  }
 
-    visualization_msgs::msg::MarkerArray arr;
-
-    // 기존 마커 지우기
-    {
-      visualization_msgs::msg::Marker del;
-      del.header.frame_id = frame_id;
-      del.header.stamp    = stamp;
-      del.ns              = "aligned_frames";
-      del.id              = 0;
-      del.action          = visualization_msgs::msg::Marker::DELETEALL;
-      arr.markers.push_back(del);
-    }
-
-    const int N = static_cast<int>(aligned_frames.size());
-    int next_id = 1;
-
-    for (int i = 0; i < N; ++i) {
-      const auto &frame_pts = aligned_frames[i];
-      if (frame_pts.empty()) continue;
-
-      visualization_msgs::msg::Marker m;
-      m.header.frame_id = frame_id;
-      m.header.stamp    = stamp;
-      m.ns              = "aligned_frames";
-      m.id              = next_id++;
-      m.type            = visualization_msgs::msg::Marker::SPHERE_LIST;
-      m.action          = visualization_msgs::msg::Marker::ADD;
-      m.scale.x = m.scale.y = m.scale.z = point_scale;
-
-      // 오래된 프레임일수록 어둡게: hue는 고정하고 value만 낮춤(또는 hue를 프레임별로 바꿔도 됨)
-      // 여기서는 hue를 프레임별로 조금씩 변화 + 밝기는 (i/N)로 점점 어둡게
-      float r=1, g=1, b=1;
-      double hue = ( (N > 1) ? (static_cast<double>(i) / (N-1)) : 0.0 ); // 0~1
-      double val = 0.95 * (0.35 + 0.65 * (1.0 - static_cast<double>(i)/std::max(1, N-1))); // 최신이 더 밝게
-      hsvToRgb(hue, 0.9, val, r, g, b);
-      m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 0.95f;
-
-      // 점들 채우기
-      m.points.reserve(frame_pts.size());
-      for (const auto &ps : frame_pts) {
-        geometry_msgs::msg::Point p;
-        p.x = ps.point.x; p.y = ps.point.y; p.z = ps.point.z;
-        m.points.push_back(p);
-      }
-
-      m.lifetime = rclcpp::Duration::from_seconds(lifetime_sec);
-      arr.markers.push_back(m);
-
-      // 프레임 인덱스 텍스트(선택)
-      visualization_msgs::msg::Marker t;
-      t.header.frame_id = frame_id;
-      t.header.stamp    = stamp;
-      t.ns              = "aligned_frames_text";
-      t.id              = next_id++;
-      t.type            = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-      t.action          = visualization_msgs::msg::Marker::ADD;
-      t.scale.z         = point_scale * 3.0;
-      t.color.r = t.color.g = t.color.b = 1.0f; t.color.a = 0.9f;
-
-      // 레이블은 프레임 중앙 근처에 표시
-      geometry_msgs::msg::Point center{};
-      for (const auto &ps : frame_pts) { center.x += ps.point.x; center.y += ps.point.y; center.z += ps.point.z; }
-      center.x /= frame_pts.size(); center.y /= frame_pts.size(); center.z /= frame_pts.size();
-      center.z += point_scale * 2.0; // 살짝 위
-      t.pose.position = center;
-
-      char buf[64];
-      std::snprintf(buf, sizeof(buf), "frame %d/%d", i, N-1);
-      t.text = buf;
-      t.lifetime = rclcpp::Duration::from_seconds(lifetime_sec);
-      arr.markers.push_back(t);
-    }
-
-    pub->publish(arr);
+  [[nodiscard]] double GetProximityThreshold() const noexcept {
+    return config_.proximity_threshold;
   }
   
-  inline void visualizeFootprint(
-    const std::vector<geometry_msgs::msg::Point>& footprint,
-    int dyn_label,  // 0: static, 1: dynamic
-    const std::string& frame_id,
-    int id,
-    const rclcpp::Time& stamp,
-    const rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr& publisher)
-  {
-    if (!publisher || footprint.empty()) return;
-
-    visualization_msgs::msg::MarkerArray arr;
-
-    // ===== Line Strip =====
-    visualization_msgs::msg::Marker line;
-    line.header.frame_id = frame_id;
-    line.header.stamp = stamp;
-    line.ns = "footprint_line";
-    line.id = id;
-    line.type = visualization_msgs::msg::Marker::LINE_STRIP;
-    line.action = visualization_msgs::msg::Marker::ADD;
-    line.pose.orientation.w = 1.0;
-    line.scale.x = 0.03;  // line width
-    line.lifetime = rclcpp::Duration::from_seconds(0.5); // 실시간 갱신용 (0으로 하면 영구 표시)
-
-    // 색상 설정
-    if (dyn_label == 0) { // STATIC
-      line.color.r = 0.0f;
-      line.color.g = 1.0f;
-      line.color.b = 0.0f;
-      line.color.a = 0.8f;
-    } else { // DYNAMIC
-      line.color.r = 1.0f;
-      line.color.g = 0.0f;
-      line.color.b = 0.0f;
-      line.color.a = 0.9f;
-    }
-
-    // footprint 점 연결
-    for (const auto& p : footprint)
-      line.points.push_back(p);
-
-    // 폐곡선 처리 (선택)
-    if (footprint.size() > 2)
-      line.points.push_back(footprint.front());
-
-    // ===== Sphere List =====
-    visualization_msgs::msg::Marker spheres = line;
-    spheres.ns = "footprint_points";
-    spheres.id = id + 10000;
-    spheres.type = visualization_msgs::msg::Marker::SPHERE_LIST;
-    spheres.scale.x = 0.06;
-    spheres.scale.y = 0.06;
-    spheres.scale.z = 0.06;
-    spheres.points = footprint;
-
-    // ===== Array 발행 =====
-    arr.markers.push_back(line);
-    arr.markers.push_back(spheres);
-    publisher->publish(arr);
+  [[nodiscard]] double GetBoundaryThreshold() const noexcept {
+    return config_.boundary_threshold;
+  }
+  
+  [[nodiscard]] int GetTargetFrameIndex() const noexcept {
+    return config_.target_frame_index;
   }
 
-  inline std::vector<geometry_msgs::msg::Point>
-  extractNearestCluster(
-      const geometry_msgs::msg::Point& obj,
-      const std::vector<std::vector<geometry_msgs::msg::PointStamped>>& aligned_frames,
-      double eps = 0.12,          // DBSCAN half-width
-      int    minPts = 3,          // DBSCAN min points
-      double search_radius = 0.40,// 후보 탐색 반경(성능/오류 완화)
-      bool   exclude_current = true,
-      int    required_distinct_frames = 5
-  ) const
-  {
-    struct P2 { double x, y; int f; };     // f: frame index 추가
-    std::vector<P2> pool; pool.reserve(1024);
-    if (aligned_frames.empty()) return {};
+  /**
+   * @brief Transform historical object detections to current frame
+   * 
+   * @param historical_objects Object-pose pairs from historical frames
+   * @param current_pose Current robot pose in map frame
+   * @return Transformed point collections, each representing one historical frame
+   */
+  [[nodiscard]] TransformedFrames TransformHistoricalObjects(
+      const std::vector<ObjectPosePair>& historical_objects,
+      const geometry_msgs::msg::Pose& current_pose) const {
+    
+    TransformedFrames output;
+    output.reserve(historical_objects.size());
 
-    // 1) obj 주변 search_radius 안의 포인트만 모아서 후보 풀 구성 (+ 최소 3개 프레임 조건)
-    const double R2 = search_radius * search_radius;
-    const int last = static_cast<int>(aligned_frames.size()) - 1;
-    const int end_idx = exclude_current ? last : last + 1; // 현재 프레임 제외 여부
+    const Eigen::Matrix4d transform_map_to_current = 
+        MapManager::PoseToMatrix(current_pose);
+    const Eigen::Matrix4d transform_current_to_map = 
+        transform_map_to_current.inverse();
 
-    for (int i = 0; i < end_idx; ++i) {
-      for (const auto& ps : aligned_frames[i]) {
-        const double dx = ps.point.x - obj.x;
-        const double dy = ps.point.y - obj.y;
-        if (!std::isfinite(dx) || !std::isfinite(dy)) continue;
-        if (dx*dx + dy*dy <= R2) pool.push_back({ps.point.x, ps.point.y, i});
+    for (const auto& [frame_points, historical_pose] : historical_objects) {
+      // Transform: historical_local -> map -> current_local
+      const Eigen::Matrix4d transform_map_to_historical = 
+          MapManager::PoseToMatrix(historical_pose);
+      const Eigen::Matrix4d transform_current_to_historical = 
+          transform_current_to_map * transform_map_to_historical;
+
+      PointVector transformed_frame;
+      transformed_frame.reserve(frame_points.size());
+
+      for (const auto& point_stamped : frame_points) {
+        const Eigen::Vector4d point_historical(
+            point_stamped.point.x,
+            point_stamped.point.y,
+            point_stamped.point.z,
+            1.0
+        );
+        
+        const Eigen::Vector4d point_current = 
+            transform_current_to_historical * point_historical;
+
+        geometry_msgs::msg::PointStamped output_point;
+        output_point.header.stamp = point_stamped.header.stamp;
+        output_point.point.x = point_current.x();
+        output_point.point.y = point_current.y();
+        output_point.point.z = point_current.z();
+
+        transformed_frame.emplace_back(std::move(output_point));
       }
+      
+      output.emplace_back(std::move(transformed_frame));
     }
-    if (pool.size() < static_cast<size_t>(minPts)) return {};
-
-    // 후보 풀에 기여한 고유 프레임 수 확인 (3개 미만이면 즉시 탈락)
-    {
-      int max_frames = std::max(1, end_idx);               // 안전 처리
-      std::vector<char> seen(max_frames, 0);
-      int distinct = 0;
-      for (const auto& p : pool) {
-        if (p.f >= 0 && p.f < max_frames && !seen[p.f]) {
-          seen[p.f] = 1; distinct++;
-          if (distinct >= required_distinct_frames) break;
-        }
-      }
-      if (distinct < required_distinct_frames) return {};  // 최소 3개 프레임 조건 불만족
-    }
-
-    // 2) DBSCAN (2D)
-    const double eps2 = eps * eps;
-    const int N = static_cast<int>(pool.size());
-    std::vector<int> labels(N, -1);  // -1: unvisited, -2: noise, >=0: cluster id
-
-    auto regionQuery = [&](int i){
-      std::vector<int> nb; nb.reserve(32);
-      for (int j = 0; j < N; ++j) {
-        if (j == i) continue;
-        const double dx = pool[i].x - pool[j].x;
-        const double dy = pool[i].y - pool[j].y;
-        if (dx*dx + dy*dy <= eps2) nb.push_back(j);
-      }
-      return nb;
-    };
-
-    int cid = 0;
-    for (int i = 0; i < N; ++i) {
-      if (labels[i] != -1) continue;
-      auto neigh = regionQuery(i);
-      if (static_cast<int>(neigh.size()) + 1 < minPts) { labels[i] = -2; continue; } // noise
-      labels[i] = cid;
-      std::vector<int> seeds = neigh;
-      for (size_t k = 0; k < seeds.size(); ++k) {
-        int j = seeds[k];
-        if (labels[j] == -2) labels[j] = cid;     // border → core
-        if (labels[j] != -1) continue;            // visited
-        labels[j] = cid;
-        auto neigh_j = regionQuery(j);
-        if (static_cast<int>(neigh_j.size()) + 1 >= minPts) {
-          seeds.insert(seeds.end(), neigh_j.begin(), neigh_j.end());
-        }
-      }
-      cid++;
-    }
-
-    if (cid == 0) return {};
-
-    // 3) obj와 가장 가까운 클러스터 선택 (센트로이드 기준)
-    auto dist = [](double ax, double ay, double bx, double by){
-      const double dx = ax - bx, dy = ay - by;
-      return std::sqrt(dx*dx + dy*dy);
-    };
-
-    int best_c = -1;
-    double best_d = std::numeric_limits<double>::infinity();
-
-    for (int c = 0; c < cid; ++c) {
-      double sx=0.0, sy=0.0; int cnt=0;
-      for (int i = 0; i < N; ++i) if (labels[i] == c) { sx += pool[i].x; sy += pool[i].y; cnt++; }
-      if (cnt == 0) continue;
-      const double cx = sx / cnt, cy = sy / cnt;
-      const double d  = dist(cx, cy, obj.x, obj.y);
-      if (d < best_d) { best_d = d; best_c = c; }
-    }
-
-    if (best_c < 0) return {};
-
-    // 4) 선택된 클러스터의 포인트들을 geometry_msgs::msg::Point 로 반환
-    std::vector<geometry_msgs::msg::Point> cluster;
-    for (int i = 0; i < N; ++i) {
-      if (labels[i] != best_c) continue;
-      geometry_msgs::msg::Point p;
-      p.x = pool[i].x; p.y = pool[i].y; p.z = 0.0;
-      cluster.push_back(p);
-    }
-    return cluster;
+    
+    return output;
   }
 
-  static inline double computeFootprintSpan(const std::vector<geometry_msgs::msg::Point>& cluster)
-  {
-    if (cluster.size() < 2) return std::numeric_limits<double>::quiet_NaN();
+  /**
+   * @brief Visualize aligned historical frames as markers
+   * 
+   * @param aligned_frames Transformed historical frames in current coordinate system
+   * @param frame_id ROS frame ID for markers
+   * @param stamp Timestamp for markers
+   * @param publisher Marker array publisher
+   * @param point_scale Size of point markers
+   * @param lifetime_sec Marker lifetime in seconds
+   */
+  void PublishAlignedFramesMarkers(
+      const TransformedFrames& aligned_frames,
+      const std::string& frame_id,
+      const rclcpp::Time& stamp,
+      const MarkerPublisher& publisher,
+      double point_scale = 0.06,
+      double lifetime_sec = 0.25) const {
+    
+    if (!publisher || aligned_frames.empty()) {
+      return;
+    }
 
-    auto dist = [](const geometry_msgs::msg::Point& a, const geometry_msgs::msg::Point& b){
-      const double dx=a.x-b.x, dy=a.y-b.y, dz=a.z-b.z;
-      return std::sqrt(dx*dx + dy*dy + dz*dz);
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    // Delete previous markers
+    visualization_msgs::msg::Marker delete_marker;
+    delete_marker.header.frame_id = frame_id;
+    delete_marker.header.stamp = stamp;
+    delete_marker.ns = "aligned_frames";
+    delete_marker.id = 0;
+    delete_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+    marker_array.markers.push_back(delete_marker);
+
+    const int total_frames = static_cast<int>(aligned_frames.size());
+    int marker_id = 1;
+
+    for (int frame_idx = 0; frame_idx < total_frames; ++frame_idx) {
+      const auto& frame_points = aligned_frames[frame_idx];
+      if (frame_points.empty()) {
+        continue;
+      }
+
+      // Create sphere list marker for points
+      visualization_msgs::msg::Marker sphere_marker;
+      sphere_marker.header.frame_id = frame_id;
+      sphere_marker.header.stamp = stamp;
+      sphere_marker.ns = "aligned_frames";
+      sphere_marker.id = marker_id++;
+      sphere_marker.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+      sphere_marker.action = visualization_msgs::msg::Marker::ADD;
+      sphere_marker.scale.x = sphere_marker.scale.y = sphere_marker.scale.z = point_scale;
+
+      // Color: older frames darker, newer frames brighter
+      const double hue = (total_frames > 1) 
+          ? static_cast<double>(frame_idx) / (total_frames - 1) 
+          : 0.0;
+      const double value = 0.95 * (0.35 + 0.65 * (1.0 - static_cast<double>(frame_idx) / 
+          std::max(1, total_frames - 1)));
+      
+      const RgbColor color = HsvToRgb(hue, 0.9, value);
+      sphere_marker.color.r = color.r;
+      sphere_marker.color.g = color.g;
+      sphere_marker.color.b = color.b;
+      sphere_marker.color.a = 0.95f;
+
+      // Add points to marker
+      sphere_marker.points.reserve(frame_points.size());
+      for (const auto& point_stamped : frame_points) {
+        geometry_msgs::msg::Point point;
+        point.x = point_stamped.point.x;
+        point.y = point_stamped.point.y;
+        point.z = point_stamped.point.z;
+        sphere_marker.points.push_back(point);
+      }
+
+      sphere_marker.lifetime = rclcpp::Duration::from_seconds(lifetime_sec);
+      marker_array.markers.push_back(sphere_marker);
+
+      // Add text marker for frame index
+      visualization_msgs::msg::Marker text_marker;
+      text_marker.header = sphere_marker.header;
+      text_marker.ns = "aligned_frames_text";
+      text_marker.id = marker_id++;
+      text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+      text_marker.action = visualization_msgs::msg::Marker::ADD;
+      text_marker.scale.z = point_scale * 3.0;
+      text_marker.color.r = text_marker.color.g = text_marker.color.b = 1.0f;
+      text_marker.color.a = 0.9f;
+
+      // Calculate centroid for text position
+      geometry_msgs::msg::Point centroid{};
+      for (const auto& ps : frame_points) {
+        centroid.x += ps.point.x;
+        centroid.y += ps.point.y;
+        centroid.z += ps.point.z;
+      }
+      centroid.x /= frame_points.size();
+      centroid.y /= frame_points.size();
+      centroid.z /= frame_points.size();
+      centroid.z += point_scale * 2.0; // Slightly above points
+
+      text_marker.pose.position = centroid;
+      text_marker.text = "frame " + std::to_string(frame_idx) + "/" + 
+                         std::to_string(total_frames - 1);
+      text_marker.lifetime = rclcpp::Duration::from_seconds(lifetime_sec);
+      marker_array.markers.push_back(text_marker);
+    }
+
+    publisher->publish(marker_array);
+  }
+
+  /**
+   * @brief Visualize obstacle footprint with dynamic/static classification
+   * 
+   * @param footprint Footprint points to visualize
+   * @param obstacle_type Classification result
+   * @param frame_id ROS frame ID
+   * @param marker_id Unique marker ID
+   * @param stamp Timestamp
+   * @param publisher Marker publisher
+   */
+  void VisualizeFootprint(
+      const std::vector<geometry_msgs::msg::Point>& footprint,
+      ObstacleType obstacle_type,
+      const std::string& frame_id,
+      int marker_id,
+      const rclcpp::Time& stamp,
+      const MarkerPublisher& publisher) const {
+    
+    if (!publisher || footprint.empty()) {
+      return;
+    }
+
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    // Line strip marker
+    visualization_msgs::msg::Marker line_marker;
+    line_marker.header.frame_id = frame_id;
+    line_marker.header.stamp = stamp;
+    line_marker.ns = "footprint_line";
+    line_marker.id = marker_id;
+    line_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    line_marker.action = visualization_msgs::msg::Marker::ADD;
+    line_marker.pose.orientation.w = 1.0;
+    line_marker.scale.x = 0.03; // Line width
+    line_marker.lifetime = rclcpp::Duration::from_seconds(0.5);
+
+    // Set color based on classification
+    if (obstacle_type == ObstacleType::kStatic) {
+      line_marker.color.r = 0.0f;
+      line_marker.color.g = 1.0f;
+      line_marker.color.b = 0.0f;
+      line_marker.color.a = 0.8f;
+    } else {
+      line_marker.color.r = 1.0f;
+      line_marker.color.g = 0.0f;
+      line_marker.color.b = 0.0f;
+      line_marker.color.a = 0.9f;
+    }
+
+    // Add footprint points
+    for (const auto& point : footprint) {
+      line_marker.points.push_back(point);
+    }
+
+    // Close the loop if we have enough points
+    if (footprint.size() > 2) {
+      line_marker.points.push_back(footprint.front());
+    }
+
+    // Sphere list marker
+    visualization_msgs::msg::Marker sphere_marker = line_marker;
+    sphere_marker.ns = "footprint_points";
+    sphere_marker.id = marker_id + 10000;
+    sphere_marker.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+    sphere_marker.scale.x = sphere_marker.scale.y = sphere_marker.scale.z = 0.06;
+    sphere_marker.points = footprint;
+
+    marker_array.markers.push_back(line_marker);
+    marker_array.markers.push_back(sphere_marker);
+    
+    publisher->publish(marker_array);
+  }
+
+  /**
+   * @brief Extract nearest cluster around an object using DBSCAN
+   * 
+   * @param object_position Target object position
+   * @param aligned_frames Historical frames aligned to current coordinate system
+   * @param exclude_current Whether to exclude the most recent frame
+   * @return Cluster points if found, empty vector otherwise
+   */
+  [[nodiscard]] std::vector<geometry_msgs::msg::Point> ExtractNearestCluster(
+      const geometry_msgs::msg::Point& object_position,
+      const TransformedFrames& aligned_frames,
+      bool exclude_current = true) const {
+    
+    struct Point2DWithFrame {
+      double x;
+      double y;
+      int frame_index;
     };
 
-    // seed: 임의(0)
-    const size_t n = cluster.size();
-    size_t seed = 0;
+    std::vector<Point2DWithFrame> candidate_pool;
+    candidate_pool.reserve(1024);
 
-    // 1-pass: seed에서 가장 먼 점 A
-    size_t ia = seed; double da = -1.0;
-    for (size_t i=0;i<n;++i){
-      double d = dist(cluster[i], cluster[seed]);
-      if (d > da) { da = d; ia = i; }
+    if (aligned_frames.empty()) {
+      return {};
     }
-    // 2-pass: A에서 가장 먼 거리 = 근사 지름
+
+    // Collect candidate points within search radius
+    const double search_radius_sq = config_.search_radius * config_.search_radius;
+    const int last_frame_idx = static_cast<int>(aligned_frames.size()) - 1;
+    const int end_idx = exclude_current ? last_frame_idx : (last_frame_idx + 1);
+
+    for (int frame_idx = 0; frame_idx < end_idx; ++frame_idx) {
+      for (const auto& point_stamped : aligned_frames[frame_idx]) {
+        const double dx = point_stamped.point.x - object_position.x;
+        const double dy = point_stamped.point.y - object_position.y;
+        
+        if (!std::isfinite(dx) || !std::isfinite(dy)) {
+          continue;
+        }
+        
+        if (dx * dx + dy * dy <= search_radius_sq) {
+          candidate_pool.push_back({
+            point_stamped.point.x,
+            point_stamped.point.y,
+            frame_idx
+          });
+        }
+      }
+    }
+
+    if (candidate_pool.size() < static_cast<size_t>(config_.dbscan_min_points)) {
+      return {};
+    }
+
+    // Check minimum distinct frames requirement
+    if (!HasSufficientDistinctFrames(candidate_pool, end_idx)) {
+      return {};
+    }
+
+    // Run DBSCAN clustering
+    const auto cluster_labels = RunDbscan2D(candidate_pool);
+    
+    if (cluster_labels.empty()) {
+      return {};
+    }
+
+    // Find cluster nearest to object
+    const int nearest_cluster_id = FindNearestCluster(
+        candidate_pool,
+        cluster_labels,
+        object_position);
+
+    if (nearest_cluster_id < 0) {
+      return {};
+    }
+
+    // Extract points from the nearest cluster
+    return ExtractClusterPoints(candidate_pool, cluster_labels, nearest_cluster_id);
+  }
+
+  /**
+   * @brief Classify obstacle as static or dynamic based on footprint analysis
+   * 
+   * @param object_position Object to classify
+   * @param aligned_frames Historical frames in current coordinate system
+   * @param exclude_current Whether to exclude current frame from analysis
+   * @param[out] output_cluster Optional output for extracted cluster
+   * @param[out] output_span Optional output for computed footprint span
+   * @return Classification result
+   */
+  [[nodiscard]] ObstacleType ClassifyDynamicByFootprint(
+      const geometry_msgs::msg::Point& object_position,
+      const TransformedFrames& aligned_frames,
+      bool exclude_current = true,
+      std::vector<geometry_msgs::msg::Point>* output_cluster = nullptr,
+      double* output_span = nullptr) const {
+    
+    // Extract nearest cluster
+    auto cluster = ExtractNearestCluster(
+        object_position,
+        aligned_frames,
+        exclude_current);
+
+    if (output_cluster) {
+      *output_cluster = cluster;
+    }
+
+    if (cluster.size() < static_cast<size_t>(config_.dbscan_min_points)) {
+      return ObstacleType::kUnknown;
+    }
+
+    // Compute footprint span
+    const double span = ComputeFootprintSpan(cluster);
+    
+    if (output_span) {
+      *output_span = span;
+    }
+
+    if (!std::isfinite(span)) {
+      return ObstacleType::kUnknown;
+    }
+
+    // Classify based on motion threshold
+    return (span > config_.motion_threshold) 
+        ? ObstacleType::kDynamic 
+        : ObstacleType::kStatic;
+  }
+
+  /**
+   * @brief Compute span (diameter) of point cluster
+   * 
+   * Uses a two-pass algorithm to approximate the diameter efficiently.
+   * 
+   * @param cluster Points forming the cluster
+   * @return Maximum distance between any two points, or NaN if < 2 points
+   */
+  [[nodiscard]] static double ComputeFootprintSpan(
+      const std::vector<geometry_msgs::msg::Point>& cluster) noexcept {
+    
+    if (cluster.size() < 2) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    auto compute_distance = [](const geometry_msgs::msg::Point& a,
+                               const geometry_msgs::msg::Point& b) {
+      const double dx = a.x - b.x;
+      const double dy = a.y - b.y;
+      const double dz = a.z - b.z;
+      return std::sqrt(dx * dx + dy * dy + dz * dz);
+    };
+
+    // Two-pass diameter approximation
+    const size_t seed_idx = 0;
+    
+    // First pass: find farthest point from seed
+    size_t farthest_idx = seed_idx;
+    double max_distance = -1.0;
+    
+    for (size_t i = 0; i < cluster.size(); ++i) {
+      const double distance = compute_distance(cluster[i], cluster[seed_idx]);
+      if (distance > max_distance) {
+        max_distance = distance;
+        farthest_idx = i;
+      }
+    }
+
+    // Second pass: find farthest point from the first farthest point
     double span = 0.0;
-    for (size_t i=0;i<n;++i){
-      double d = dist(cluster[i], cluster[ia]);
-      if (d > span) span = d;
+    for (size_t i = 0; i < cluster.size(); ++i) {
+      const double distance = compute_distance(cluster[i], cluster[farthest_idx]);
+      span = std::max(span, distance);
     }
+
     return span;
   }
 
-  inline int classifyDynamicByFootprint(
-      const geometry_msgs::msg::Point& obj,
-      const std::vector<std::vector<geometry_msgs::msg::PointStamped>>& aligned_frames,
-      double eps = 0.12,           // DBSCAN 반경
-      int    minPts = 3,           // DBSCAN 최소 포인트 수
-      double search_radius = 0.60, // obj 주변 후보 수집 반경
-      bool   exclude_current = true,
-      double motion_thresh = 0.10, // 10cm
-      std::vector<geometry_msgs::msg::Point>* out_cluster = nullptr,
-      double* out_span = nullptr
-  ) const
-  {
-    // 1) obj와 가장 가까운 과거 클러스터 추출
-    auto cluster = extractNearestCluster(obj, aligned_frames, eps, minPts, search_radius, exclude_current);
-    if (out_cluster) *out_cluster = cluster;
-    if (cluster.size() < static_cast<size_t>(minPts)) return -1;
-    
-    // 2) 발자취 span 계산
-    const double span = computeFootprintSpan(cluster);
-    if (out_span) *out_span = span;
-    if (!std::isfinite(span)) return -1;
-
-    // 3) 판정
-    return (span > motion_thresh) ? 1 : 0; // 1=dynamic, 0=static
-  }
-  
 private:
+  /**
+   * @brief Convert HSV color to RGB
+   */
+  [[nodiscard]] static RgbColor HsvToRgb(
+      double hue,
+      double saturation,
+      double value) noexcept {
+    
+    const double i = std::floor(hue * 6.0);
+    const double f = hue * 6.0 - i;
+    const double p = value * (1.0 - saturation);
+    const double q = value * (1.0 - f * saturation);
+    const double t = value * (1.0 - (1.0 - f) * saturation);
 
-  static inline void hsvToRgb(double h, double s, double v, float &r, float &g, float &b) {
-    double i = std::floor(h * 6.0);
-    double f = h * 6.0 - i;
-    double p = v * (1.0 - s);
-    double q = v * (1.0 - f * s);
-    double t = v * (1.0 - (1.0 - f) * s);
+    RgbColor color;
+    
     switch (static_cast<int>(i) % 6) {
-      case 0: r = v; g = t; b = p; break;
-      case 1: r = q; g = v; b = p; break;
-      case 2: r = p; g = v; b = t; break;
-      case 3: r = p; g = q; b = v; break;
-      case 4: r = t; g = p; b = v; break;
-      case 5: r = v; g = p; b = q; break;
+      case 0: color.r = value; color.g = t; color.b = p; break;
+      case 1: color.r = q; color.g = value; color.b = p; break;
+      case 2: color.r = p; color.g = value; color.b = t; break;
+      case 3: color.r = p; color.g = q; color.b = value; break;
+      case 4: color.r = t; color.g = p; color.b = value; break;
+      case 5: color.r = value; color.g = p; color.b = q; break;
     }
+    
+    return color;
   }
 
-  double threshold1_{0.05};  // [m] 예: 아주 근접 (정적/정합으로 간주)
-  double threshold2_{0.1};  // [m] 예: 경계 구간 상한 
-  int    target_frame_idx_{5}; //default는 5 이전의 frame
+  /**
+   * @brief Check if candidate pool has sufficient distinct frames
+   */
+  template<typename PointType>
+  [[nodiscard]] bool HasSufficientDistinctFrames(
+      const std::vector<PointType>& points,
+      int max_frames) const noexcept {
+    
+    std::vector<bool> frame_seen(std::max(1, max_frames), false);
+    int distinct_count = 0;
+
+    for (const auto& point : points) {
+      if (point.frame_index >= 0 && 
+          point.frame_index < max_frames && 
+          !frame_seen[point.frame_index]) {
+        frame_seen[point.frame_index] = true;
+        distinct_count++;
+        
+        if (distinct_count >= config_.min_distinct_frames) {
+          return true;
+        }
+      }
+    }
+
+    return distinct_count >= config_.min_distinct_frames;
+  }
+
+  /**
+   * @brief Run DBSCAN clustering on 2D points
+   */
+  template<typename PointType>
+  [[nodiscard]] std::vector<int> RunDbscan2D(
+      const std::vector<PointType>& points) const {
+    
+    const int num_points = static_cast<int>(points.size());
+    std::vector<int> labels(num_points, -1); // -1: unvisited, -2: noise, >=0: cluster ID
+    
+    const double eps_sq = config_.dbscan_epsilon * config_.dbscan_epsilon;
+
+    auto region_query = [&](int point_idx) {
+      std::vector<int> neighbors;
+      neighbors.reserve(32);
+      
+      for (int j = 0; j < num_points; ++j) {
+        if (j == point_idx) continue;
+        
+        const double dx = points[point_idx].x - points[j].x;
+        const double dy = points[point_idx].y - points[j].y;
+        
+        if (dx * dx + dy * dy <= eps_sq) {
+          neighbors.push_back(j);
+        }
+      }
+      
+      return neighbors;
+    };
+
+    int cluster_id = 0;
+    
+    for (int i = 0; i < num_points; ++i) {
+      if (labels[i] != -1) {
+        continue; // Already processed
+      }
+      
+      auto neighbors = region_query(i);
+      
+      if (static_cast<int>(neighbors.size()) + 1 < config_.dbscan_min_points) {
+        labels[i] = -2; // Mark as noise
+        continue;
+      }
+      
+      // Start new cluster
+      labels[i] = cluster_id;
+      std::vector<int> seed_set = neighbors;
+      
+      for (size_t k = 0; k < seed_set.size(); ++k) {
+        const int current_idx = seed_set[k];
+        
+        if (labels[current_idx] == -2) {
+          labels[current_idx] = cluster_id; // Change noise to border point
+        }
+        
+        if (labels[current_idx] != -1) {
+          continue; // Already processed
+        }
+        
+        labels[current_idx] = cluster_id;
+        
+        auto current_neighbors = region_query(current_idx);
+        if (static_cast<int>(current_neighbors.size()) + 1 >= config_.dbscan_min_points) {
+          seed_set.insert(seed_set.end(), 
+                         current_neighbors.begin(), 
+                         current_neighbors.end());
+        }
+      }
+      
+      cluster_id++;
+    }
+
+    return labels;
+  }
+
+  /**
+   * @brief Find cluster nearest to target position
+   */
+  template<typename PointType>
+  [[nodiscard]] int FindNearestCluster(
+      const std::vector<PointType>& points,
+      const std::vector<int>& labels,
+      const geometry_msgs::msg::Point& target) const noexcept {
+    
+    const int num_points = static_cast<int>(points.size());
+    const int max_cluster_id = labels.empty() ? 
+        0 : *std::max_element(labels.begin(), labels.end());
+    
+    if (max_cluster_id < 0) {
+      return -1;
+    }
+
+    int best_cluster_id = -1;
+    double best_distance = std::numeric_limits<double>::infinity();
+
+    for (int cluster_id = 0; cluster_id <= max_cluster_id; ++cluster_id) {
+      double sum_x = 0.0;
+      double sum_y = 0.0;
+      int count = 0;
+
+      // Compute centroid
+      for (int i = 0; i < num_points; ++i) {
+        if (labels[i] == cluster_id) {
+          sum_x += points[i].x;
+          sum_y += points[i].y;
+          count++;
+        }
+      }
+
+      if (count == 0) {
+        continue;
+      }
+
+      const double centroid_x = sum_x / count;
+      const double centroid_y = sum_y / count;
+      const double dx = centroid_x - target.x;
+      const double dy = centroid_y - target.y;
+      const double distance = std::sqrt(dx * dx + dy * dy);
+
+      if (distance < best_distance) {
+        best_distance = distance;
+        best_cluster_id = cluster_id;
+      }
+    }
+
+    return best_cluster_id;
+  }
+
+  /**
+   * @brief Extract all points belonging to a specific cluster
+   */
+  template<typename PointType>
+  [[nodiscard]] static std::vector<geometry_msgs::msg::Point> ExtractClusterPoints(
+      const std::vector<PointType>& points,
+      const std::vector<int>& labels,
+      int cluster_id) {
+    
+    std::vector<geometry_msgs::msg::Point> cluster_points;
+    
+    for (size_t i = 0; i < points.size(); ++i) {
+      if (labels[i] == cluster_id) {
+        geometry_msgs::msg::Point point;
+        point.x = points[i].x;
+        point.y = points[i].y;
+        point.z = 0.0;
+        cluster_points.push_back(point);
+      }
+    }
+    
+    return cluster_points;
+  }
+
+  Config config_;
 };

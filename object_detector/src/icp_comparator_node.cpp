@@ -124,7 +124,7 @@ private:
         enable_icp_ = this->get_parameter("enable_icp").as_bool();
         max_history_for_icp_ = this->get_parameter("max_history_for_icp").as_int();
 
-        map_manager_.set_max_deque_size(max_history_frames_);
+        map_manager_.SetMaxDequeSize(max_history_frames_);
     }
 
     void print_parameters(){
@@ -339,7 +339,7 @@ private:
         current_msg.header = scan_msg->header;
         pub_current_scan_->publish(current_msg);
 
-        map_manager_.addCloudWithPose(
+        map_manager_.AddCloudWithPose(
             std::make_shared<sensor_msgs::msg::PointCloud2>(current_msg),
             odom_msg->pose.pose);
 
@@ -386,7 +386,7 @@ private:
         const CloudPtr& current_cloud,
         const Eigen::Matrix4d& current_transform)
     {
-        auto pairs = map_manager_.snapshot_pairs();
+        auto pairs = map_manager_.GetCloudPoseSnapshot();
         if (pairs.size() < 2) {
             return;
         }
