@@ -82,10 +82,14 @@ public:
     this->get_parameter("scan_topic", scan_topic_);
     this->get_parameter("odom_topic", odom_topic_);
 
+    tf_buffer_   = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
     static_pub_      = this->create_publisher<geometry_msgs::msg::PointStamped>("/static_obstacle", 10);
     dynamic_pub_     = this->create_publisher<nav_msgs::msg::Odometry>("/dynamic_obstacle", 20);
     dbscan_vis_pub_  = this->create_publisher<visualization_msgs::msg::MarkerArray>("/dbscan_clusters", 10);
     wall_accum_pub_  = this->create_publisher<sensor_msgs::msg::PointCloud2>("/wall_points_accum", 10);
+    footprint_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("footprint_markers", 10);
 
     current_scan_pub_   = this->create_publisher<sensor_msgs::msg::PointCloud2>("/current_scan_pcl", 10);
     aligned_history_pub_= this->create_publisher<sensor_msgs::msg::PointCloud2>("/aligned_history_scans", 10);
@@ -218,6 +222,7 @@ private:
       geometry_msgs::msg::PointStamped pt;
       pt.header = m.header;
       pt.point  = m.pose.position;
+      last_transform_stamp_ = m.header.stamp;
       candidate_points_.push_back(pt);
     }
 
@@ -288,6 +293,11 @@ private:
         /*motion_thresh=*/0.2,
         &footprint, &span
       );
+
+      detector_.visualizeFootprint(
+        footprint, dyn,
+        "laser", static_cast<int>(i),
+        this->now(), footprint_pub_);
 
       if (dyn == 0) {
         labels[i] = STATIC;
@@ -389,11 +399,9 @@ private:
         if (d2 < best_d2) { best_d2 = d2; best = &centers[i]; }
       }
       if (best) {
-        geometry_msgs::msg::PointStamped ps;
-        ps.header.frame_id = centers.front().header.frame_id.empty() ? "map" : centers.front().header.frame_id;
-        ps.header.stamp    = best->header.stamp;
-        ps.point = best->point;
-        static_pub_->publish(ps);
+        // auto best_map = transformLaserToMap(*best, *tf_buffer_, rclcpp::Duration::from_seconds(1));
+        auto best_map = transformLocalWithPose(*best, last_odom_);
+        static_pub_->publish(best_map);   
       }
     }
 
@@ -403,7 +411,9 @@ private:
       if (!dyns.empty()) {
         const geometry_msgs::msg::PointStamped* meas = chooseDynamicMeasurement(dyns);
         if (meas) {
-          processAndUpdateMeasurementWithPoint(meas->point.x, meas->point.y, meas->header.stamp);
+          // auto meas_map = transformLaserToMap(*meas, *tf_buffer_, rclcpp::Duration::from_seconds(1));
+          auto meas_map = transformLocalWithPose(*meas, last_odom_);
+          processAndUpdateMeasurementWithPoint(meas_map.point.x, meas_map.point.y, meas_map.header.stamp);
         } else {
           if (kalman_initialized_) {
             const rclcpp::Time current_stamp = centers.front().header.stamp;
@@ -633,11 +643,86 @@ private:
     dynamic_pub_->publish(odom_msg);
   }
 
+  inline geometry_msgs::msg::PointStamped
+  transformLaserToMap(
+      const geometry_msgs::msg::PointStamped& p_laser_in,
+      tf2_ros::Buffer& tf_buffer,
+      const rclcpp::Duration& timeout = rclcpp::Duration::from_seconds(0.5),
+      const std::string& laser_frame = "laser",
+      const std::string& map_frame   = "map")
+  {
+    // 입력의 frame_id가 비어있으면 laser_frame로 보정
+    geometry_msgs::msg::PointStamped p_laser = p_laser_in;
+    if (p_laser.header.frame_id.empty())
+      p_laser.header.frame_id = laser_frame;
+
+    const rclcpp::Time stamp = last_transform_stamp_;
+
+    geometry_msgs::msg::PointStamped p_map;
+
+    auto T_map_odom =
+        tf_buffer.lookupTransform(map_frame, p_laser.header.frame_id, stamp, timeout);
+    tf2::doTransform(p_laser, p_map, T_map_odom);
+
+    // 결과는 map 프레임
+    p_map.header.frame_id = map_frame;
+    return p_map;
+    
+  }
+  
+  inline Eigen::Matrix4d poseToT(const geometry_msgs::msg::Pose &pose)
+  {
+    Eigen::Quaterniond q(pose.orientation.w,
+                         pose.orientation.x,
+                         pose.orientation.y,
+                         pose.orientation.z);
+    q.normalize();
+
+    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+    T.block<3,3>(0,0) = q.toRotationMatrix();
+    T(0,3) = pose.position.x;
+    T(1,3) = pose.position.y;
+    T(2,3) = pose.position.z;
+    return T;
+  }
+
+  // 로컬(보통 base_link) 점을 last_odom_ 포즈의 좌표계(= last_odom_->header.frame_id)로 변환
+  inline geometry_msgs::msg::PointStamped
+  transformLocalWithPose(
+      const geometry_msgs::msg::PointStamped& p_local,              // 로컬 프레임 점
+      const nav_msgs::msg::Odometry::ConstSharedPtr& last_odom)     // 현재 포즈
+  {
+    if (!last_odom) {
+      throw std::runtime_error("transformLocalWithPose: last_odom_ is null");
+    }
+
+    // SE(3) 구성: world(= last_odom_->header.frame_id) <- base_link
+    const Eigen::Matrix4d T_world_base = poseToT(last_odom->pose.pose);
+
+    // 동차좌표로 변환
+    const Eigen::Vector4d pl(p_local.point.x, p_local.point.y, p_local.point.z, 1.0);
+    const Eigen::Vector4d pw = T_world_base * pl;
+
+    geometry_msgs::msg::PointStamped out;
+    // stamp는 입력 혹은 last_odom 기준 중 하나 택일
+    out.header.stamp     = (p_local.header.stamp.sec || p_local.header.stamp.nanosec)
+                           ? p_local.header.stamp
+                           : last_odom->header.stamp;
+    out.header.frame_id  = last_odom->header.frame_id;   // 보통 "map" 또는 "odom"
+    out.point.x = pw.x();
+    out.point.y = pw.y();
+    out.point.z = pw.z();
+    return out;
+  }
+  
 private:
 
   inline rclcpp::Time to_node_time(const builtin_interfaces::msg::Time& t) const {
     return rclcpp::Time(t, this->get_clock()->get_clock_type());
   }
+
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr marker_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_only_sub_;
@@ -649,9 +734,10 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr current_scan_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_history_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr aligned_history_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr footprint_pub_;
 
   std::string scan_topic_{"/scan"};
-  std::string odom_topic_{"/odom_airio"};
+  std::string odom_topic_{"/odom"};
 
   message_filters::Subscriber<sensor_msgs::msg::LaserScan> scan_sub_;
   message_filters::Subscriber<nav_msgs::msg::Odometry> odom_sub_;
@@ -686,10 +772,7 @@ private:
   double voxel_leaf_{0.03};
   int    knn_k_{5};
   double wall_dist_thresh_{0.06};
-
-
-  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
+  rclcpp::Time last_transform_stamp_{0, 0, RCL_ROS_TIME};
 
   MapManager scan_map_manager_;
   MapManager obj_manager_;

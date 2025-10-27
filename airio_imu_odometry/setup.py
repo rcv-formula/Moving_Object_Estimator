@@ -1,26 +1,19 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 import os
 from glob import glob
 
 package_name = 'airio_imu_odometry'
 
-def package_files(directory):
-    paths = []
-    for (path, _, filenames) in os.walk(directory):
-        for filename in filenames:
-            paths.append(os.path.join(path, filename))
-    return paths
-
 setup(
     name=package_name,
     version='0.0.1',
-    packages=[package_name],
+    # ★ 서브패키지까지 포함
+    packages=find_packages(include=[package_name, f'{package_name}.*']),
     data_files=[
-        ('share/ament_index/resource_index/packages',
-         ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
-        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+        ('share/ament_index/resource_index/packages', [f'resource/{package_name}']),
+        (f'share/{package_name}', ['package.xml']),
+        (f'share/{package_name}/launch', glob('launch/*.launch.py')),
+        (f'share/{package_name}/config', glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -32,7 +25,9 @@ setup(
     entry_points={
         'console_scripts': [
             'airio_node = airio_imu_odometry.airio_node:main',
-            'imu_result_plot = airio_imu_odometry.imu_result_plot:main',
+            'imu_result_plot = airio_imu_odometry.nodes.imu_result_plot:main',
+            'ate_rte_evaluator = airio_imu_odometry.nodes.ate_rte_evaluator:main',
+            'profile_airio = airio_imu_odometry.nodes.profile_airio:main',
         ],
     },
 )

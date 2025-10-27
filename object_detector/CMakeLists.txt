@@ -87,19 +87,23 @@ ament_target_dependencies(delay_monitor_node
   message_filters
   geometry_msgs
 )
-add_executable(scan_aligner_node src/scan_aligner_node.cpp)
 
-ament_target_dependencies(scan_aligner_node
-  "rclcpp"
-  "sensor_msgs"
-  "nav_msgs"
-  "message_filters"
-  "pcl_conversions"
-  "PCL"
+add_executable(icp_comparator_node
+  src/icp_comparator_node.cpp
 )
 
-target_include_directories(scan_aligner_node PUBLIC
-  $<BUILD_INTERFACE:${EIGEN3_INCLUDE_DIRS}>
+ament_target_dependencies(icp_comparator_node
+  rclcpp
+  sensor_msgs
+  nav_msgs
+  std_msgs
+  geometry_msgs
+  message_filters
+  pcl_conversions
+)
+
+target_link_libraries(icp_comparator_node
+  ${PCL_LIBRARIES}
 )
 
 # 설치 대상 설정
@@ -108,7 +112,7 @@ install(TARGETS
   obstacle_detector_node
   visualization_node
   delay_monitor_node
-  scan_aligner_node
+  icp_comparator_node
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/

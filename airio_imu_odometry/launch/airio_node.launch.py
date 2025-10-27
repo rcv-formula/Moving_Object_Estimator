@@ -21,6 +21,7 @@ def generate_launch_description():
             output="screen",
             parameters=[ 
                 params, {
+                'use_sim_time': True,
                 "airimu_root": airimu_root,
                 "airimu_ckpt": airimu_ckpt,
                 "airimu_conf": airimu_conf,
@@ -28,7 +29,7 @@ def generate_launch_description():
                 "airio_ckpt": airio_ckpt,
                 "airio_conf": airio_conf,
                 "device": "cuda",
-                "airimu_seqlen": 5,
+                "airimu_seqlen": 30,
                 "airimu_stride": 1,
                 "airio_model": "CodeNetMotion",
                 "airio_seqlen": 10,                     
@@ -36,6 +37,8 @@ def generate_launch_description():
                 "publish_rate": 40.0,
                 "timming_logging_mode": False,
                 "timming_logging_outputpath" : timming_logging_output_path,
+                "use_odom_init": True,
+                "use_odom_realign": True,
             }]
         )
     ])

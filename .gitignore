@@ -1,5 +1,7 @@
 build/
 install/
 log/
+bag/
 bags/
+rosbag*/
 .vscode

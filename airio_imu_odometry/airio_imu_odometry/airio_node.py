@@ -23,13 +23,10 @@ torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 torch.set_grad_enabled(False)  # 전역 autograd off
 import time
-import pypose as pp
 
 from airio_imu_odometry.airimu_wrapper import AirIMUCorrector, ImuData
 from airio_imu_odometry.airio_wrapper import AirIOWrapper
-from airio_imu_odometry.velocity_integrator import VelocityIntegrator
-from airio_imu_odometry.tools import _so3_from_xyzw
-
+from airio_imu_odometry.ekf_wrapper import AirIOEKFWrapper, ImuSample, EkfParams
 
 class AirIoImuOdomNode(Node):
     def __init__(self):
@@ -45,17 +42,13 @@ class AirIoImuOdomNode(Node):
         self.declare_parameter("airio_root", "")
         self.declare_parameter("airio_ckpt", "")
         self.declare_parameter("airio_conf", "")
-        # PyPose는 기본 CPU float32 권장(작은 배치에 GPU 오버헤드 큼)
         self.declare_parameter("device", "cpu")
-        # seqlen=12 → 500Hz / 12 ≈ 41.7Hz
-        self.declare_parameter("airimu_seqlen", 10)
-        # 처리 호출 중 퍼블리시 빈도 (1이면 매번 퍼블리시)
-        self.declare_parameter("publish_every", 1)
-        # 처리 호출 중 AirIO 추론 빈도 (2면 반만 추론하고 나머지는 최근값 재사용)
-        self.declare_parameter("airio_every", 3)
+        self.declare_parameter("airimu_seqlen", 100)
+        # 퍼블리시는 단순화(권장: 1), airio_every만 유지
+        self.declare_parameter("airio_every", 5)
         self.declare_parameter("timming_logging_mode", False)
         self.declare_parameter("timming_logging_outputpath", ".")
-        # self.declare_parameter('use_sim_time', True)
+        self.declare_parameter("odom_pub_rate", 50.0)  # 추가: /odom_airio 퍼블리시 주기(Hz)
 
         airimu_root = self.get_parameter("airimu_root").get_parameter_value().string_value
         airimu_ckpt = self.get_parameter("airimu_ckpt").get_parameter_value().string_value
@@ -65,11 +58,13 @@ class AirIoImuOdomNode(Node):
         airio_conf  = self.get_parameter("airio_conf").get_parameter_value().string_value
         device_str  = self.get_parameter("device").get_parameter_value().string_value
         self.seqlen = int(self.get_parameter("airimu_seqlen").get_parameter_value().integer_value)
-        self.pub_every = max(1, int(self.get_parameter("publish_every").get_parameter_value().integer_value))
         self.airio_every = max(1, int(self.get_parameter("airio_every").get_parameter_value().integer_value))
         self.TL_out_path = self.get_parameter("timming_logging_outputpath").get_parameter_value().string_value
         self.TL_mode     = bool(self.get_parameter("timming_logging_mode").get_parameter_value().bool_value)
-
+        self.odom_pub_rate = float(self.get_parameter("odom_pub_rate").get_parameter_value().double_value)
+        self._pub_period = 1.0 / max(1e-6, self.odom_pub_rate)
+        self._last_pub_ts = 0.0  # 초 단위(ROS time)
+        
         # --- Init gating ---
         self.initialized = False
         self.init_lock   = threading.Lock()
@@ -83,29 +78,30 @@ class AirIoImuOdomNode(Node):
 
         # --- Modules ---
         self.corrector = AirIMUCorrector(
-            airimu_root=airimu_root, ckpt_path=airimu_ckpt, conf_path=airimu_conf,
-            device=device_str, seqlen=self.seqlen
+            airimu_root=airimu_root,
+            ckpt_path=airimu_ckpt, 
+            conf_path=airimu_conf,
+            device=device_str, 
+            seqlen=self.seqlen
         )
         self.airio = AirIOWrapper(
-            airio_root=airio_root, ckpt_path=airio_ckpt, conf_path=airio_conf, device=device_str
+            airio_root=airio_root,
+            ckpt_path=airio_ckpt,
+            conf_path=airio_conf,
+            device=device_str
         )
 
-        # --- Pypose INTEGRATOR ---
-        self.pp_integrator = None
-        self.last_integrated_stamp = None
-        self.gravity = 9.81007
-        # PyPose는 CPU 권장
-        self.pp_dev = torch.device("cpu")
+        self.ekf = AirIOEKFWrapper(
+            airio_root=airio_root,
+            use_repo=True,
+            params=EkfParams(gyro_noise=0.02, acc_noise=0.20)
+        )
 
-        # 사전할당 버퍼 (float32, device 상주)
-        self._pp_dt  = None  # shape [1,1,1], float32
-        self._pp_gyr = None  # shape [1,1,3], float32
-        self._pp_acc = None  # shape [1,1,3], float32
+        # --- 상수/상태 ---
+        self.gravity = 9.81007
 
         # --- Subs & Pubs ---
-
         self._wait_for_sim_time(timeout_sec=5.0)
-            
         self.create_subscription(
             Imu, '/imu/data_raw', self.imu_callback,
             qos_profile_sensor_data, callback_group=self.cbgroup_imu
@@ -121,7 +117,10 @@ class AirIoImuOdomNode(Node):
         self.samples_since_proc = 0
         self.proc_lock = threading.Lock()  # 재진입 방지
         self.proc_count = 0                # 퍼블리시/에어아이오 디커플링용 카운터
-        self.last_net_vel = np.zeros(3, dtype=float)  # AirIO 추론 스킵 시 재사용
+
+        # AirIO 예측/불확실도 최근값 (airio_every>1일 때 재사용)
+        self.last_net_vel = np.zeros(3, dtype=float)
+        self.last_eta_v   = np.array([0.05, 0.05, 0.05], dtype=float)
 
         if self.corrector.ready:
             self.get_logger().info("AIR-IMU ready.")
@@ -135,26 +134,27 @@ class AirIoImuOdomNode(Node):
 
         self.get_logger().info("Waiting for /odom to initialize...")
 
-        # --- Velocity_Integrator ---
-        self.net_vel_is_body = True
-        self.vel_integ = None  # (CPU/double 유지)
+        try:
+            if getattr(self.ekf, "use_repo", False) and getattr(self.ekf, "repo_ekf", None) is not None:
+                self.get_logger().info(f"EKF backend: Air-IO repo -> {self.ekf.repo_ekf.__name__}")
+            else:
+                self.get_logger().warn("EKF backend: internal fallback (built-in 15-state EKF)")
+        except Exception as e:
+            self.get_logger().warn(f"EKF backend status check failed: {e}")
 
         # --- Timming_Logging ---
         self.airimu_step_t_deque = deque(maxlen=5000)
-        self.airimu_rot_step_t_deque = deque(maxlen=5000)
         self.airio_network_step_t_deque = deque(maxlen=5000)
-        self.velocity_integrator_step_t_deque = deque(maxlen=5000)
         self.total_t_deque = deque(maxlen=5000)
 
         # --- ZUPT/드리프트 방지용 상태 ---
-        self.zupt_win_sec = 0.3
-        self.gyro_thr     = 0.02
-        self.acc_thr      = 0.15
+        # self.zupt_win_sec = 0.3
+        # self.gyro_thr     = 0.02
+        # self.acc_thr      = 0.15
         self.deadband_ms  = 5.0
         self.max_dt       = 0.2
 
         self._imu_hist = deque(maxlen=2000)
-        self._last_ego_pos = np.zeros(3, dtype=float)
 
     # --- 내부 유틸 ---
     def _wait_for_sim_time(self, timeout_sec: float = 5.0):
@@ -173,13 +173,6 @@ class AirIoImuOdomNode(Node):
                     "Continuing anyway — check 'ros2 topic echo /clock' and rosbag '--clock'."
                 )
                 break
-            
-    def _prepare_pp_buffers(self):
-        """IMUPreintegrator 입력 버퍼를 device/float32로 사전할당."""
-        self._pp_dt  = torch.zeros((1, 1, 1), dtype=torch.float32, device=self.pp_dev)
-        self._pp_gyr = torch.zeros((1, 1, 3), dtype=torch.float32, device=self.pp_dev)
-        self._pp_acc = torch.zeros((1, 1, 3), dtype=torch.float32, device=self.pp_dev)
-
     def _diff_velocity(self, prev: Odometry, curr: Odometry):
         p0, p1 = prev.pose.pose.position, curr.pose.pose.position
         t0 = prev.header.stamp.sec + prev.header.stamp.nanosec * 1e-9
@@ -189,23 +182,23 @@ class AirIoImuOdomNode(Node):
             raise ValueError(f"non-positive dt: {dt}")
         return [(p1.x - p0.x)/dt, (p1.y - p0.y)/dt, (p1.z - p0.z)/dt], t1
 
-    def _is_stationary(self, now_stamp: float) -> bool:
-        if not self._imu_hist:
-            return False
-        win_start = now_stamp - self.zupt_win_sec
-        g_vals, a_vals = [], []
-        for t, g, a in self._imu_hist:
-            if t >= win_start:
-                g_vals.append(g); a_vals.append(a)
-        if len(g_vals) < 3:
-            return False
-        g_mean = float(np.mean(g_vals))
-        a_mean = float(np.mean(a_vals))
-        return (g_mean < self.gyro_thr) and (a_mean < self.acc_thr)
+    # def _is_stationary(self, now_stamp: float) -> bool:
+    #     if not self._imu_hist:
+    #         return False
+    #     win_start = now_stamp - self.zupt_win_sec
+    #     g_vals, a_vals = [], []
+    #     for t, g, a in self._imu_hist:
+    #         if t >= win_start:
+    #             g_vals.append(g); a_vals.append(a)
+    #     if len(g_vals) < 3:
+    #         return False
+    #     g_mean = float(np.mean(g_vals))
+    #     a_mean = float(np.mean(a_vals))
+    #     return (g_mean < self.gyro_thr) and (a_mean < self.acc_thr)
 
     # === Callbacks ===
     def odom_callback(self, msg: Odometry):
-        # 초기화(첫 2프레임) 로직은 그대로 유지
+        # 초기화(첫 2프레임) 로직
         if not self.initialized:
             with self.init_lock:
                 if self.initialized:
@@ -236,44 +229,16 @@ class AirIoImuOdomNode(Node):
                         self.airio.set_init_state(self.init_state)
                     if hasattr(self.corrector, "set_init_state"):
                         self.corrector.set_init_state(self.init_state)
+                    if hasattr(self.ekf, "set_init_state"):
+                        self.ekf.set_init_state(self.init_state)
                 except Exception as e:
                     self.get_logger().warn(f"set_init_state hook failed: {e}")
-
-                # === pp_integrator(float32/CPU) 생성 + 버퍼 사전할당 ===
-                try:
-                    self.pp_dev = torch.device("cpu")
-                    pos0 = torch.tensor(self.init_state["pos"], dtype=torch.float32, device=self.pp_dev)
-                    vel0 = torch.tensor(self.init_state["vel"], dtype=torch.float32, device=self.pp_dev)
-                    qx, qy, qz, qw = self.init_state["rot"]
-                    rot0 = _so3_from_xyzw(qx, qy, qz, qw, device=self.pp_dev).float()
-
-                    self.pp_integrator = pp.module.IMUPreintegrator(
-                        pos0, rot0, vel0, gravity=float(self.gravity), reset=False
-                    ).to(self.pp_dev).float()
-
-                    self._prepare_pp_buffers()
-                    self.last_integrated_stamp = None
-                except Exception as e:
-                    self.get_logger().error(f"IMUPreintegrator init failed: {e}")
-                    return
-
-                try:
-                    init_pos = torch.tensor(self.init_state["pos"], dtype=torch.float64)  # VelocityIntegrator는 기존대로
-                    self.vel_integ = VelocityIntegrator(
-                        init_pos, frame=('body' if self.net_vel_is_body else 'world'),
-                        method='trapezoid', device='cpu'
-                    ).double()
-                    self._last_ego_pos = init_pos.numpy().astype(float)
-                    self.last_integrated_stamp = None
-                except Exception as e:
-                    self.get_logger().error(f"VelocityIntegrator init failed: {e}")
-                    return
 
                 self.initialized = True
                 self.get_logger().info(f"/odom init pos={self.init_state['pos']} vel={self.init_state['vel']}")
                 return
 
-        # 초기화 이후에는 재정렬 요청만 큐잉
+        # 초기화 이후에는 재정렬 요청
         p = msg.pose.pose.position
         q = msg.pose.pose.orientation
         v = msg.twist.twist.linear
@@ -300,17 +265,18 @@ class AirIoImuOdomNode(Node):
             qx=msg.orientation.x, qy=msg.orientation.y, qz=msg.orientation.z, qw=msg.orientation.w,
             stamp=stamp
         )
+
         # add_sample 보호 (최소 락 구간)
         with self.sample_lock:
             self.corrector.add_sample(imu_in)
             self.airio.add_sample(imu_in)
 
-        # 정지 판정용 히스토리 기록(가벼운 계산)
-        gx, gy, gz = msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z
-        ax, ay, az = msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z
-        gyro_norm = float(np.linalg.norm([gx, gy, gz]))
-        acc_norm  = float(np.linalg.norm([ax, ay, az]) - self.gravity)
-        self._imu_hist.append((stamp, gyro_norm, abs(acc_norm)))
+        # 정지 판정용 히스토리 기록(가벼운 계산) — 비활성화
+        # gx, gy, gz = msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z
+        # ax, ay, az = msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z
+        # gyro_norm = float(np.linalg.norm([gx, gy, gz]))
+        # acc_norm  = float(np.linalg.norm([ax, ay, az]) - self.gravity)
+        # self._imu_hist.append((stamp, gyro_norm, abs(acc_norm)))
 
         # ====== seqlen 샘플마다 처리 트리거 ======
         self.samples_since_proc += 1
@@ -322,14 +288,35 @@ class AirIoImuOdomNode(Node):
                 finally:
                     self.samples_since_proc = 0
                     self.proc_lock.release()
+        else:
+            # seqlen 미만일 때는 EKF를 즉시 propagate + 바로 publish 
+            try:
+                # AIR-IMU가 준비되기 전까지는 최소 보정치로 EKF 예측
+                wx, wy, wz, axc, ayc, azc = self.corrector.fallback_correct_vals(imu_in)
+            except Exception:
+                # 혹시 보정 접근 실패하면 원시값 사용
+                wx, wy, wz, axc, ayc, azc = imu_in.wx, imu_in.wy, imu_in.wz, imu_in.ax, imu_in.ay, imu_in.az
+    
+            try:
+                self.ekf.add_imu(ImuSample(
+                    wx=float(wx), wy=float(wy), wz=float(wz),
+                    ax=float(axc), ay=float(ayc), az=float(azc),
+                    stamp=float(stamp)
+                ))
+            except Exception as e:
+                self.get_logger().warn(f"EKF propagate (light) failed: {e}")
+                return
+    
+            # AIR-IO 업데이트/보정 없이, EKF 상태를 즉시 퍼블리시
+            self._publish_ekf_state_if_due()
 
     # === 타이머 대신 호출되는 처리 본문 ===
+    
     def _process_once(self):
         if not self.initialized:
             return
 
         self.proc_count += 1  # 디커플링 카운터
-
         t0 = time.time()
 
         # 최신 보정값
@@ -338,105 +325,60 @@ class AirIoImuOdomNode(Node):
             return
         airimu_step_t = time.time() - t0
 
-        # === 재정렬 요청 반영 ===
+        # === 재정렬 요청 반영 (통합기 제거된 버전: EKF/모듈만 리셋) ===
         with self._realign_lock:
             req = self._realign_req
             self._realign_req = None
         if req is not None:
             try:
-                self.pp_dev = torch.device("cpu")
-                pos0 = torch.tensor(req["pos"], dtype=torch.float32, device=self.pp_dev)
-                vel0 = torch.tensor(req["vel"], dtype=torch.float32, device=self.pp_dev)
-                qx, qy, qz, qw = req["rot"].tolist()
-                rot0 = _so3_from_xyzw(qx, qy, qz, qw, device=self.pp_dev).float()
-
-                self.pp_integrator = pp.module.IMUPreintegrator(
-                    pos0, rot0, vel0, gravity=float(self.gravity), reset=False
-                ).to(self.pp_dev).float()
-
-                self._prepare_pp_buffers()
-
-                self.vel_integ = VelocityIntegrator(
-                    pos0.double(), frame=('body' if self.net_vel_is_body else 'world'),
-                    method='trapezoid', device='cpu'
-                ).double()
-                self._last_ego_pos = pos0.detach().cpu().numpy().astype(float)
-
-                self.last_integrated_stamp = req["stamp"]
-
                 self.init_state = {
                     "pos": req["pos"].tolist(),
                     "rot": req["rot"].tolist(),
                     "vel": req["vel"].tolist(),
                     "stamp": req["stamp"]
                 }
-                try:
-                    if hasattr(self.airio, "set_init_state"):
-                        self.airio.set_init_state(self.init_state)
-                    if hasattr(self.corrector, "set_init_state"):
-                        self.corrector.set_init_state(self.init_state)
-                except Exception as e:
-                    self.get_logger().warn(f"set_init_state hook failed during realign: {e}")
+                # EKF/모듈 초기화만 갱신
+                if hasattr(self.ekf, "set_init_state"):
+                    self.ekf.set_init_state(self.init_state)
+                if hasattr(self.airio, "set_init_state"):
+                    self.airio.set_init_state(self.init_state)
+                if hasattr(self.corrector, "set_init_state"):
+                    self.corrector.set_init_state(self.init_state)
             except Exception as e:
                 self.get_logger().error(f"Realign failed: {e}")
 
-        # dt 가드
-        if self.last_integrated_stamp is not None and imu_out.stamp <= self.last_integrated_stamp + 1e-12:
-            return
-        if self.last_integrated_stamp is None:
-            self.last_integrated_stamp = imu_out.stamp
-            return
-        dt = max(1e-6, imu_out.stamp - self.last_integrated_stamp)
-        if dt > self.max_dt:
-            self.last_integrated_stamp = imu_out.stamp
-            return
-        self.last_integrated_stamp = imu_out.stamp
-
-        # === PyPose 한 스텝 (float32 + 사전할당 버퍼 + inference_mode) ===
-        t1 = time.time()
+        # === EKF PROPAGATION (보정 IMU 사용) ===
         try:
-            with torch.inference_mode():
-                # 새 텐서 생성 없이 값만 갱신
-                self._pp_dt[0, 0, 0]  = float(dt)
-                self._pp_gyr[0, 0, 0] = float(imu_out.wx)
-                self._pp_gyr[0, 0, 1] = float(imu_out.wy)
-                self._pp_gyr[0, 0, 2] = float(imu_out.wz)
-                self._pp_acc[0, 0, 0] = float(imu_out.ax)
-                self._pp_acc[0, 0, 1] = float(imu_out.ay)
-                self._pp_acc[0, 0, 2] = float(imu_out.az)
-
-                state = self.pp_integrator(
-                    init_state=None, dt=self._pp_dt, gyro=self._pp_gyr, acc=self._pp_acc, rot=None
-                )
-
-                cur_pos_t = state['pos'][..., -1, :]   # [1,1,3], float32
-                cur_vel_t = state['vel'][..., -1, :]   # [1,1,3], float32
-                cur_rot_t = state['rot'][..., -1, :]   # [1,1,4], float32
-
-                # 쿼터니언 정규화 (디바이스에서)
-                nrm = torch.linalg.norm(cur_rot_t, dim=-1, keepdim=True).clamp_min(1e-9)
-                cur_rot_t = cur_rot_t / nrm
-
-                # 퍼블리시 직전에만 CPU로 꺼냄
-                cur_pos = cur_pos_t.squeeze(0).squeeze(0).cpu().numpy().astype(float)
-                cur_vel = cur_vel_t.squeeze(0).squeeze(0).cpu().numpy().astype(float)
-                cur_rot = cur_rot_t.squeeze(0).squeeze(0).cpu().numpy().astype(float)
+            self.ekf.add_imu(ImuSample(
+                wx=float(imu_out.wx), wy=float(imu_out.wy), wz=float(imu_out.wz),
+                ax=float(imu_out.ax), ay=float(imu_out.ay), az=float(imu_out.az),
+                stamp=float(imu_out.stamp)
+            ))
         except Exception as e:
-            self.get_logger().warn(f"IMUPreintegrator step failed: {e}")
-            return
-        airimu_rot_step_t = time.time() - t1
+            self.get_logger().warn(f"EKF propagate failed: {e}")
 
-        # ZUPT: 정지면 속도=0, 적분 스킵 준비
-        stationary = self._is_stationary(imu_out.stamp)
-
-        # AIR-IO 속도 예측 (정지면 0) — 디커플링: 일부 호출 스킵
+        # === AirIO 속도 예측 — 디커플링: 일부 호출 스킵(정지 판정 없음) ===
+        # stationary = self._is_stationary(imu_out.stamp)
         t2 = time.time()
-        run_airio = (self.proc_count % self.airio_every == 0) and (not stationary)
+        # run_airio = (self.proc_count % self.airio_every == 0) and (not stationary)
+        run_airio = (self.proc_count % self.airio_every == 0)
         if run_airio:
-            net_vel = np.asarray(self.airio.predict_velocity(cur_rot), dtype=float)
+            # EKF 추정 자세 사용
+            cur_rot_ekf = np.asarray(self.ekf.get_state()["rot"], dtype=float)
+            airio_out = self.airio.predict_velocity(cur_rot_ekf)
+
+            # vel + eta_v 파싱 (dict/tuple 호환)
+            if isinstance(airio_out, dict):
+                net_vel = np.asarray(airio_out.get("vel", (0.0, 0.0, 0.0)), dtype=float)
+                eta_v   = np.asarray(airio_out.get("eta_v", (0.05, 0.05, 0.05)), dtype=float)
+            else:
+                net_vel = np.asarray(airio_out, dtype=float)
+                eta_v   = np.asarray((0.05, 0.05, 0.05), dtype=float)
+
             self.last_net_vel = net_vel
+            self.last_eta_v   = eta_v
         else:
-            net_vel = self.last_net_vel  # 최근 결과 재사용(정지면 0이 유지됨)
+            net_vel = self.last_net_vel
         airio_network_step_t = time.time() - t2
 
         # 데드밴드
@@ -444,73 +386,83 @@ class AirIoImuOdomNode(Node):
             net_vel = np.zeros(3, dtype=float)
             self.last_net_vel = net_vel
 
-        # 속도 적분 → 위치
-        t3 = time.time()
-        try:
-            if stationary or np.allclose(net_vel, 0.0, atol=1e-9):
-                ego_pos = self._last_ego_pos.copy()
-            else:
-                ego_pos = self.vel_integ.step(dt, net_vel, orient=cur_rot).detach().cpu().numpy()
-                self._last_ego_pos = ego_pos.copy()
-        except Exception as e:
-            self.get_logger().warn(f"Velocity integration failed: {e}")
-            return
-        velocity_integrator_step_t = time.time() - t3
+        # === EKF UPDATE (바디 프레임 속도 + R_meas=diag(eta_v^2)) — 정지 조건 제거 ===
+        # if run_airio and not stationary:
+        if run_airio:
+            try:
+                eta_v = getattr(self, "last_eta_v", np.array([0.05, 0.05, 0.05], dtype=float))
+                R_meas = np.diag((eta_v ** 2.0).tolist())
+                self.ekf.update_velocity_body(tuple(net_vel.tolist()), R_meas)
+            except Exception as e:
+                self.get_logger().warn(f"EKF update (velocity) failed: {e}")
+
         total_t = time.time() - t0
 
         if self.TL_mode and total_t <= 0.1:
             self.airimu_step_t_deque.append(airimu_step_t)
-            self.airimu_rot_step_t_deque.append(airimu_rot_step_t)
             self.airio_network_step_t_deque.append(airio_network_step_t)
-            self.velocity_integrator_step_t_deque.append(velocity_integrator_step_t)
             self.total_t_deque.append(total_t)
 
-        # === 퍼블리시 디커플링: 일부 호출만 퍼블리시 ===
-        do_publish = (self.proc_count % self.pub_every == 0)
+        # republish IMU (보정된 최신 샘플)
+        imu_msg = Imu()
+        imu_msg.header.stamp.sec = self.imu_sec
+        imu_msg.header.stamp.nanosec = self.imu_nanosec
+        imu_msg.header.frame_id = "base_link"
+        imu_msg.angular_velocity.x = float(imu_out.wx)
+        imu_msg.angular_velocity.y = float(imu_out.wy)
+        imu_msg.angular_velocity.z = float(imu_out.wz)
+        imu_msg.linear_acceleration.x = float(imu_out.ax)
+        imu_msg.linear_acceleration.y = float(imu_out.ay)
+        imu_msg.linear_acceleration.z = float(imu_out.az)
+        imu_msg.orientation.x = float(imu_out.qx)
+        imu_msg.orientation.y = float(imu_out.qy)
+        imu_msg.orientation.z = float(imu_out.qz)
+        imu_msg.orientation.w = float(imu_out.qw)
+        self.filtered_pub.publish(imu_msg)
 
-        if do_publish:
-            # republish IMU (보정된 최신 샘플)
-            imu_msg = Imu()
-            imu_msg.header.stamp.sec = self.imu_sec
-            imu_msg.header.stamp.nanosec = self.imu_nanosec
-            imu_msg.header.frame_id = "base_link"
-            imu_msg.angular_velocity.x = float(imu_out.wx)
-            imu_msg.angular_velocity.y = float(imu_out.wy)
-            imu_msg.angular_velocity.z = float(imu_out.wz)
-            imu_msg.linear_acceleration.x = float(imu_out.ax)
-            imu_msg.linear_acceleration.y = float(imu_out.ay)
-            imu_msg.linear_acceleration.z = float(imu_out.az)
-            imu_msg.orientation.x = float(imu_out.qx)
-            imu_msg.orientation.y = float(imu_out.qy)
-            imu_msg.orientation.z = float(imu_out.qz)
-            imu_msg.orientation.w = float(imu_out.qw)
-            self.filtered_pub.publish(imu_msg)
+        # publish odom (frame=map) — EKF 상태 직결
+        self._publish_ekf_state()
 
-            # publish odom (frame=map)
-            odom = Odometry()
-            odom.header.stamp = self.get_clock().now().to_msg()
-            odom.header.frame_id = "map"
-            odom.child_frame_id = "base_link"
-            odom.pose.pose.position.x = float(ego_pos[0])
-            odom.pose.pose.position.y = float(ego_pos[1])
-            odom.pose.pose.position.z = float(ego_pos[2])
-            odom.pose.pose.orientation.x = float(cur_rot[0])
-            odom.pose.pose.orientation.y = float(cur_rot[1])
-            odom.pose.pose.orientation.z = float(cur_rot[2])
-            odom.pose.pose.orientation.w = float(cur_rot[3])
-            odom.twist.twist.linear.x = float(net_vel[0])
-            odom.twist.twist.linear.y = float(net_vel[1])
-            odom.twist.twist.linear.z = float(net_vel[2])
-            self.odom_pub.publish(odom)
+    def _now_ros_time_sec(self) -> float:
+        # ROS 시뮬레이션 시간(/clock) 사용 시에도 안전하게 초 단위 반환
+        nsec = self.get_clock().now().nanoseconds
+        return float(nsec) * 1e-9
+    
+    def _publish_ekf_state_if_due(self):
+        now = self._now_ros_time_sec()
+        if (now - self._last_pub_ts) < self._pub_period:
+            return
+        self._last_pub_ts = now
+        self._publish_ekf_state()
 
+    def _publish_ekf_state(self):
+        s = self.ekf.get_state()
+        pos = np.asarray(s["pos"], dtype=float)
+        rot = np.asarray(s["rot"], dtype=float)
+        vel = np.asarray(s["vel"], dtype=float)
+    
+        odom = Odometry()
+        odom.header.stamp = self.get_clock().now().to_msg()
+        odom.header.frame_id = "map"
+        odom.child_frame_id = "base_link"
+        odom.pose.pose.position.x = float(pos[0])
+        odom.pose.pose.position.y = float(pos[1])
+        odom.pose.pose.position.z = float(pos[2])
+        odom.pose.pose.orientation.x = float(rot[0])
+        odom.pose.pose.orientation.y = float(rot[1])
+        odom.pose.pose.orientation.z = float(rot[2])
+        odom.pose.pose.orientation.w = float(rot[3])
+        odom.twist.twist.linear.x = float(vel[0])
+        odom.twist.twist.linear.y = float(vel[1])
+        odom.twist.twist.linear.z = float(vel[2])
+        self.odom_pub.publish(odom)
+        
     # (옵션) 타이밍 저장
     def save_timings(self):
         import matplotlib.pyplot as plt  # 필요 시에만 임포트(지연 로딩)
         timings = {
             "AIR-IMU": list(self.airimu_step_t_deque),
-            "AIR-IMU RotStep": list(self.airimu_rot_step_t_deque),
             "AIR-IO Network": list(self.airio_network_step_t_deque),
-            "VelocityIntegrator": list(self.velocity_integrator_step_t_deque),
             "Total": list(self.total_t_deque),
         }
         outdir = os.path.dirname(self.TL_out_path) or "."

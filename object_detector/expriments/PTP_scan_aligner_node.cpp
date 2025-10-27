@@ -41,7 +41,7 @@ public:
         sensor_msgs::msg::LaserScan, nav_msgs::msg::Odometry>;
 
     scan_sub_.subscribe(this, "/scan", rmw_qos_profile_sensor_data);
-    odom_sub_.subscribe(this, "/odom_airio", rmw_qos_profile_sensor_data);
+    odom_sub_.subscribe(this, "/odom", rmw_qos_profile_sensor_data);
 
     sync_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(SyncPolicy(1000), scan_sub_, odom_sub_);
     sync_->registerCallback(std::bind(&ScanAligner::syncCallback, this, _1, _2));
@@ -51,11 +51,11 @@ public:
     aligned_history_icp_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/aligned_history_scans_icp", 10);
 
     // ICP 파라미터(런타임 override 가능)
-    this->declare_parameter<int>("icp.max_iterations", 2);
-    this->declare_parameter<double>("icp.max_corr_dist", 0.5);
+    this->declare_parameter<int>("icp.max_iterations", 5);
+    this->declare_parameter<double>("icp.max_corr_dist", 0.2);
     this->declare_parameter<double>("icp.trans_eps", 1e-6);
     this->declare_parameter<double>("icp.fit_eps", 1e-5);
-    this->declare_parameter<double>("icp.voxel_leaf", 0.1);
+    this->declare_parameter<double>("icp.voxel_leaf", 0.2);
     this->declare_parameter<bool>("icp.use_downsample", true);
     this->declare_parameter<bool>("icp.reject_far", false);
     this->declare_parameter<double>("icp.reject_radius", 3.0);
