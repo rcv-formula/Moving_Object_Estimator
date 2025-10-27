@@ -1,10 +1,18 @@
 cmake_minimum_required(VERSION 3.5)
 project(object_detector)
 
-# C++ 표준 (필요시 14 이상으로 설정)
-if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
-endif()
+# === MPI 설정 (깨진 HPCX 경로 회피, 시스템 OpenMPI 고정) ===
+# 필요 시 조건문으로 감싸도 됨.
+set(MPI_C_COMPILER "/usr/bin/mpicc" CACHE FILEPATH "MPI C compiler path")
+set(MPI_CXX_COMPILER "/usr/bin/mpicxx" CACHE FILEPATH "MPI C++ compiler path")
+set(MPI_HOME "/usr/lib/aarch64-linux-gnu/openmpi" CACHE PATH "MPI home path")
+set(CMAKE_IGNORE_PREFIX_PATH "/opt/hpcx" CACHE PATH "Ignore broken HPCX path")
+
+find_package(MPI REQUIRED COMPONENTS C CXX)
+include_directories(${MPI_C_INCLUDE_PATH})
+
+find_package(PCL REQUIRED COMPONENTS common io filters visualization)  
+
 
 # ament_cmake 및 의존 패키지 찾기
 find_package(ament_cmake REQUIRED)
@@ -79,19 +87,23 @@ ament_target_dependencies(delay_monitor_node
   message_filters
   geometry_msgs
 )
-add_executable(scan_aligner_node src/scan_aligner_node.cpp)
 
-ament_target_dependencies(scan_aligner_node
-  "rclcpp"
-  "sensor_msgs"
-  "nav_msgs"
-  "message_filters"
-  "pcl_conversions"
-  "PCL"
+add_executable(icp_comparator_node
+  src/icp_comparator_node.cpp
 )
 
-target_include_directories(scan_aligner_node PUBLIC
-  $<BUILD_INTERFACE:${EIGEN3_INCLUDE_DIRS}>
+ament_target_dependencies(icp_comparator_node
+  rclcpp
+  sensor_msgs
+  nav_msgs
+  std_msgs
+  geometry_msgs
+  message_filters
+  pcl_conversions
+)
+
+target_link_libraries(icp_comparator_node
+  ${PCL_LIBRARIES}
 )
 
 # 설치 대상 설정
@@ -100,7 +112,7 @@ install(TARGETS
   obstacle_detector_node
   visualization_node
   delay_monitor_node
-  scan_aligner_node
+  icp_comparator_node
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/

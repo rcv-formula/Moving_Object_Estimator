@@ -23,7 +23,7 @@ ENV LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8" LANGUAGE="en_US.UTF-8"
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ros-humble-desktop \
       ros-dev-tools \
-      # ros-humble-tiago-gazebo \
+      ros-humble-rmw-cyclonedds-cpp \  
       python3-colcon-common-extensions python3-flake8 python3-pip \
       python3-pytest-cov python3-rosdep python3-setuptools python3-vcstool \
       wget python3-argcomplete libasio-dev libtinyxml2-dev libcunit1-dev \

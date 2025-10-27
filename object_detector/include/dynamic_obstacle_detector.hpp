@@ -79,72 +79,6 @@ public:
     return out;
   }
 
-    inline int isDynamic(
-      const std::vector<std::vector<geometry_msgs::msg::PointStamped>>& aligned_frames,
-      const geometry_msgs::msg::Point& obj_point  // ← const& 권장
-  ) const
-  {
-    using PXYZ = pcl::PointXYZ;
-
-    // 프레임 최소 2장 필요(타깃 + 현재)
-    if (aligned_frames.size() < 2) return -1;
-
-    const int curr_idx = static_cast<int>(aligned_frames.size()) - 1;
-
-    // 타깃 프레임 인덱스 정규화: 유효하지 않거나 현재 프레임이면 바로 이전 프레임 사용
-    int tgt = target_frame_idx_;
-    if (tgt < 0 || tgt >= static_cast<int>(aligned_frames.size()) || tgt == curr_idx) {
-      tgt = curr_idx - 1;
-      if (tgt < 0) return -1;
-    }
-
-    const auto& tgt_pts = aligned_frames[tgt];
-    if (tgt_pts.empty()) return -1;
-
-    // 타깃 프레임 KD-Tree
-    pcl::PointCloud<PXYZ>::Ptr tgt_cloud(new pcl::PointCloud<PXYZ>());
-    tgt_cloud->reserve(tgt_pts.size());
-    for (const auto& ps : tgt_pts) {
-      PXYZ p;
-      p.x = static_cast<float>(ps.point.x);
-      p.y = static_cast<float>(ps.point.y);
-      p.z = static_cast<float>(ps.point.z);
-      tgt_cloud->push_back(p);
-    }
-    if (tgt_cloud->empty()) return -1;
-
-    pcl::KdTreeFLANN<PXYZ> kdtree;
-    kdtree.setInputCloud(tgt_cloud);
-
-    // 현재 장애물의 대표점(obj_point)만을 사용하여 반경 판정
-    PXYZ q;
-    q.x = static_cast<float>(obj_point.x);
-    q.y = static_cast<float>(obj_point.y);
-    q.z = static_cast<float>(obj_point.z);
-
-    const float t1 = static_cast<float>(threshold1_);
-    const float t2 = static_cast<float>(threshold2_);
-
-    // 1) threshold1 반경 내 존재 여부 → 정적(0)
-    {
-      std::vector<int> idx;
-      std::vector<float> sq;
-      int found = kdtree.radiusSearch(q, t1, idx, sq);
-      if (found > 0) return 0;  // static
-    }
-
-    // 2) (t1, t2] 반경 내 존재 여부 → 동적(1)
-    {
-      std::vector<int> idx;
-      std::vector<float> sq;
-      int found = kdtree.radiusSearch(q, t2, idx, sq);
-      if (found > 0) return 1;  // dynamic
-    }
-
-    // 3) t2 초과 → unknown(-1)
-    return -1;
-  }
-
   inline void publishAlignedFramesMarkers(
       const std::vector<std::vector<geometry_msgs::msg::PointStamped>> &aligned_frames,
       const std::string &frame_id,
@@ -230,21 +164,84 @@ public:
 
     pub->publish(arr);
   }
+  
+  inline void visualizeFootprint(
+    const std::vector<geometry_msgs::msg::Point>& footprint,
+    int dyn_label,  // 0: static, 1: dynamic
+    const std::string& frame_id,
+    int id,
+    const rclcpp::Time& stamp,
+    const rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr& publisher)
+  {
+    if (!publisher || footprint.empty()) return;
+
+    visualization_msgs::msg::MarkerArray arr;
+
+    // ===== Line Strip =====
+    visualization_msgs::msg::Marker line;
+    line.header.frame_id = frame_id;
+    line.header.stamp = stamp;
+    line.ns = "footprint_line";
+    line.id = id;
+    line.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    line.action = visualization_msgs::msg::Marker::ADD;
+    line.pose.orientation.w = 1.0;
+    line.scale.x = 0.03;  // line width
+    line.lifetime = rclcpp::Duration::from_seconds(0.5); // 실시간 갱신용 (0으로 하면 영구 표시)
+
+    // 색상 설정
+    if (dyn_label == 0) { // STATIC
+      line.color.r = 0.0f;
+      line.color.g = 1.0f;
+      line.color.b = 0.0f;
+      line.color.a = 0.8f;
+    } else { // DYNAMIC
+      line.color.r = 1.0f;
+      line.color.g = 0.0f;
+      line.color.b = 0.0f;
+      line.color.a = 0.9f;
+    }
+
+    // footprint 점 연결
+    for (const auto& p : footprint)
+      line.points.push_back(p);
+
+    // 폐곡선 처리 (선택)
+    if (footprint.size() > 2)
+      line.points.push_back(footprint.front());
+
+    // ===== Sphere List =====
+    visualization_msgs::msg::Marker spheres = line;
+    spheres.ns = "footprint_points";
+    spheres.id = id + 10000;
+    spheres.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+    spheres.scale.x = 0.06;
+    spheres.scale.y = 0.06;
+    spheres.scale.z = 0.06;
+    spheres.points = footprint;
+
+    // ===== Array 발행 =====
+    arr.markers.push_back(line);
+    arr.markers.push_back(spheres);
+    publisher->publish(arr);
+  }
+
   inline std::vector<geometry_msgs::msg::Point>
   extractNearestCluster(
       const geometry_msgs::msg::Point& obj,
       const std::vector<std::vector<geometry_msgs::msg::PointStamped>>& aligned_frames,
       double eps = 0.12,          // DBSCAN half-width
       int    minPts = 3,          // DBSCAN min points
-      double search_radius = 0.60,// 후보 탐색 반경(성능/오류 완화)
-      bool   exclude_current = true
+      double search_radius = 0.40,// 후보 탐색 반경(성능/오류 완화)
+      bool   exclude_current = true,
+      int    required_distinct_frames = 5
   ) const
   {
-    struct P2 { double x, y; };
+    struct P2 { double x, y; int f; };     // f: frame index 추가
     std::vector<P2> pool; pool.reserve(1024);
     if (aligned_frames.empty()) return {};
 
-    // 1) obj 주변 search_radius 안의 포인트만 모아서 후보 풀 구성
+    // 1) obj 주변 search_radius 안의 포인트만 모아서 후보 풀 구성 (+ 최소 3개 프레임 조건)
     const double R2 = search_radius * search_radius;
     const int last = static_cast<int>(aligned_frames.size()) - 1;
     const int end_idx = exclude_current ? last : last + 1; // 현재 프레임 제외 여부
@@ -254,10 +251,24 @@ public:
         const double dx = ps.point.x - obj.x;
         const double dy = ps.point.y - obj.y;
         if (!std::isfinite(dx) || !std::isfinite(dy)) continue;
-        if (dx*dx + dy*dy <= R2) pool.push_back({ps.point.x, ps.point.y});
+        if (dx*dx + dy*dy <= R2) pool.push_back({ps.point.x, ps.point.y, i});
       }
     }
     if (pool.size() < static_cast<size_t>(minPts)) return {};
+
+    // 후보 풀에 기여한 고유 프레임 수 확인 (3개 미만이면 즉시 탈락)
+    {
+      int max_frames = std::max(1, end_idx);               // 안전 처리
+      std::vector<char> seen(max_frames, 0);
+      int distinct = 0;
+      for (const auto& p : pool) {
+        if (p.f >= 0 && p.f < max_frames && !seen[p.f]) {
+          seen[p.f] = 1; distinct++;
+          if (distinct >= required_distinct_frames) break;
+        }
+      }
+      if (distinct < required_distinct_frames) return {};  // 최소 3개 프레임 조건 불만족
+    }
 
     // 2) DBSCAN (2D)
     const double eps2 = eps * eps;

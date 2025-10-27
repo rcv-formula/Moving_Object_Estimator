@@ -35,4 +35,3 @@ obstacle_detector_node:
     kalman_measurement_noise: 0.05  # (m², m²/s²) 칼만 필터의 업데이트 단계에서 측정치의 노이즈(불확실성)를 나타내는 값
     use_kalman_filter: true        # () kalman filter 적용 여부
     obstacle_timeout: 0.03          # (초) 이 시간동안 측정값이 없으면 장애물 없음으로 간주
-    
