@@ -250,9 +250,9 @@ class OdomFusionEkfNode(Node):
             else:
                 Rp  = C6[:3,:3]
                 Rth = C6[3:,3:]
-
-        Rp  = np.diag([0.05, 0.05, 0.10])               
-        Rth = np.diag([np.deg2rad(1)**2]*3)             
+                
+        Rp  = np.diag([0.05, 0.05, 0.10])               # m²
+        Rth = np.diag([np.deg2rad(1)**2]*3)             # rad²
         try:
             lam = self.ekf.update_pose_world_adaptive(
                 p_meas=p, q_meas=q,
