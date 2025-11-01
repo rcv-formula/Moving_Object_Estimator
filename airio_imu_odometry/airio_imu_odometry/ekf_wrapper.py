@@ -5,6 +5,26 @@ from pathlib import Path
 import sys
 import numpy as np
 
+def quat_conj(q: np.ndarray) -> np.ndarray:
+    x,y,z,w = q
+    return np.array([-x,-y,-z, w], dtype=float)
+
+def quat_log(q: np.ndarray) -> np.ndarray:
+    """
+    Log: SO(3) quaternion -> so(3) vector (axis*angle)
+    q = [vx, vy, vz, w], unit quaternion
+    return phi in R^3 (rotation vector)
+    """
+    x, y, z, w = q
+    w = np.clip(w, -1.0, 1.0)
+    s2 = x*x + y*y + z*z
+    if s2 < 1e-16:
+        return np.zeros(3, dtype=float)
+    s = np.sqrt(s2)
+    angle = 2.0 * np.arctan2(s, w)  # in [0, 2pi)
+    axis = np.array([x, y, z], dtype=float) / s
+    return axis * angle
+
 def quat_normalize(q: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(q)
     if n < 1e-12:
@@ -293,3 +313,88 @@ class AirIOEKFWrapper:
             "P": self.P.copy(),
             "stamp": float(self.last_t if self.last_t is not None else 0.0)
         }
+    # --- AirIOEKFWrapper 클래스 내부에 추가 ---
+    def update_pose_world_adaptive(self,
+                               p_meas: np.ndarray,
+                               q_meas: np.ndarray,
+                               R_p: np.ndarray,
+                               R_theta: np.ndarray,
+                               chi2_thresh: float = 22.46,
+                               alpha_max: float = 50.0,
+                               skip_thresh: Optional[float] = None) -> float:
+        """
+        월드 좌표계 포즈 측정으로 EKF 업데이트(위치+자세, 6D).
+        - 혁신 r = [p_meas - p;  Log(q_meas * conj(q_pred))]  (자세는 회전벡터 residual)
+        - 게이팅: lam = rᵀ S⁻¹ r  (dof=6 가정). lam > chi2_thresh면 R를 인플레이트.
+          skip_thresh가 주어지고 lam > skip_thresh면 업데이트를 스킵.
+        - 반환: lam (마할라노비스 거리)
+        """
+        # 상태/공분산
+        p = self.p
+        q = self.q
+
+        # 6x15 H 구성: [ I3 0 I3 0 0 ] on [p v theta bg ba] 순서
+        H = np.zeros((6, 15), dtype=float)
+        H[0:3, 0:3] = np.eye(3)  # position wrt p
+        H[3:6, 6:9] = np.eye(3)  # orientation (small-angle) wrt theta
+
+        # 측정 잔차 r
+        rp = np.asarray(p_meas, float).reshape(3) - p.reshape(3)
+        # 회전 잔차: q_err = q_meas * conj(q_pred)
+        q_err = quat_mul(np.asarray(q_meas, float).reshape(4), quat_conj(q))
+        rth = quat_log(q_err)  # so(3) residual (3)
+
+        r = np.hstack([rp, rth])  # (6,)
+
+        # 측정 공분산 R (6x6)
+        R = np.zeros((6, 6), dtype=float)
+        R[0:3, 0:3] = np.asarray(R_p, float)
+        R[3:6, 3:6] = np.asarray(R_theta, float)
+
+        # 혁신 공분산 S, 마할라노비스 lam
+        S = H @ self.P @ H.T + R
+        try:
+            Sinv = np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            # 수치 문제 시 작은 eye 더해 안정화
+            Sinv = np.linalg.inv(S + 1e-9 * np.eye(6))
+        lam = float(r.T @ Sinv @ r)
+
+        # 게이팅/인플레이트 or 스킵
+        if skip_thresh is not None and lam > float(skip_thresh):
+            # 스킵: 업데이트 없이 lam만 반환
+            return lam
+
+        if lam > float(chi2_thresh):
+            alpha = min(alpha_max, lam / float(chi2_thresh))
+            R = R * alpha
+            S = H @ self.P @ H.T + R
+            try:
+                Sinv = np.linalg.inv(S)
+            except np.linalg.LinAlgError:
+                Sinv = np.linalg.inv(S + 1e-9 * np.eye(6))
+
+        # 칼만 이득/업데이트
+        K = self.P @ H.T @ Sinv
+        dx = K @ r  # [dp, dv, dtheta, dbg, dba]
+        I_KH = np.eye(15) - K @ H
+        self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T  # Joseph form이 수치적으로 더 안전
+
+        # 상태 보정
+        self.p += dx[0:3]
+        self.v += dx[3:6]
+        dtheta = dx[6:9]
+        self.bg += dx[9:12]
+        self.ba += dx[12:15]
+
+        # 쿼터니언 보정
+        theta = np.linalg.norm(dtheta)
+        if theta > 0.0:
+            axis = dtheta / theta
+            s = np.sin(theta/2.0); c = np.cos(theta/2.0)
+            dq = np.array([axis[0]*s, axis[1]*s, axis[2]*s, c], dtype=float)
+        else:
+            dq = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+        self.q = quat_normalize(quat_mul(self.q, dq))
+
+        return lam

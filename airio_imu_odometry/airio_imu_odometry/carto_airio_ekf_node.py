@@ -9,6 +9,16 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion
 from airio_imu_odometry.ekf_wrapper import AirIOEKFWrapper, ImuSample, EkfParams
 
+def _diag3_from_cov(cov_list):
+        # cov_list: 9개 원소의 row-major 3x3
+        if cov_list is None or len(cov_list) != 9:
+            return None
+        d0, d1, d2 = float(cov_list[0]), float(cov_list[4]), float(cov_list[8])
+        # ROS 규약: -1 은 unknown
+        if d0 < 0.0 or d1 < 0.0 or d2 < 0.0:
+            return None
+        return (d0, d1, d2)
+
 def quat_to_np(q: Quaternion):
     return np.array([q.x, q.y, q.z, q.w], dtype=float)
 
@@ -68,15 +78,6 @@ class OdomFusionEkfNode(Node):
         self.last_eta_v = np.array([0.05,0.05,0.05], float)  # AirIO 속도 불확실도 기본
         self.deadband_ms = 5.0
 
-    def _diag3_from_cov(cov_list):
-        # cov_list: 9개 원소의 row-major 3x3
-        if cov_list is None or len(cov_list) != 9:
-            return None
-        d0, d1, d2 = float(cov_list[0]), float(cov_list[4]), float(cov_list[8])
-        # ROS 규약: -1 은 unknown
-        if d0 < 0.0 or d1 < 0.0 or d2 < 0.0:
-            return None
-        return (d0, d1, d2)
 
     # ---------- callbacks ----------
     def cb_imu(self, m: Imu):
@@ -89,8 +90,8 @@ class OdomFusionEkfNode(Node):
             self.initialized = True
 
         try:
-            gyro_var = self._diag3_from_cov(m.angular_velocity_covariance)
-            acc_var  = self._diag3_from_cov(m.linear_acceleration_covariance)
+            gyro_var = _diag3_from_cov(m.angular_velocity_covariance)
+            acc_var  = _diag3_from_cov(m.linear_acceleration_covariance)
 
             self.ekf.add_imu(
                 ImuSample(
@@ -103,7 +104,7 @@ class OdomFusionEkfNode(Node):
                     stamp=float(stamp)
                 ),
                 gyro_var=gyro_var,
-                acc_var=gyro_var,
+                acc_var=acc_var,
             )
         except Exception as e:
             self.get_logger().warn(f"EKF predict failed: {e}")
