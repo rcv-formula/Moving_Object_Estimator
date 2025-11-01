@@ -10,6 +10,23 @@ from geometry_msgs.msg import Quaternion
 from airio_imu_odometry.ekf_wrapper import AirIOEKFWrapper, ImuSample, EkfParams
 
 # ----------------- helpers -----------------
+def _cov6_from_odom(msg: Odometry):
+    """Odometry.pose.covariance(36개)를 6x6으로. 0/음수/비정상은 None."""
+    C = np.array(msg.pose.covariance, dtype=float)
+    if C.size != 36:
+        return None
+    C = C.reshape(6, 6)
+
+    # 대각 유효성: 너무 작거나(≈0) 음수면 무효
+    diag = np.array([C[0,0], C[1,1], C[2,2], C[3,3], C[4,4], C[5,5]], dtype=float)
+    if np.any(diag <= 1e-12):   # ★ 0 포함 차단
+        return None
+
+    # 수치 안정화(대칭화 + 바닥값)
+    C = 0.5*(C + C.T)
+    C += 1e-12*np.eye(6)
+    return C
+
 def _diag3_from_cov(cov_list):
     # cov_list: 9개 원소의 row-major 3x3
     if cov_list is None or len(cov_list) != 9:
@@ -99,7 +116,7 @@ class OdomFusionEkfNode(Node):
         self.start_sec   = None             # ★ 시작 시각(웜업 계산용)
 
         # ---- subs/pubs ----
-        self.sub_imu  = self.create_subscription(Imu,      "/airimu_imu_data", self.cb_imu,  qos_profile_sensor_data)
+        self.sub_imu  = self.create_subscription(Imu,      "/airimu_imu_data", self.cb_imu,  10)
         self.sub_air  = self.create_subscription(Odometry, "/odom_airio",      self.cb_airio, 10)
         self.sub_carto= self.create_subscription(Odometry, "/odom",            self.cb_carto, 10)
         self.pub_odom = self.create_publisher(Odometry,    "/odom_fused",      10)
@@ -170,52 +187,57 @@ class OdomFusionEkfNode(Node):
         self._EKF_publisher()
 
     def cb_carto(self, m: Odometry):
-        # 타임스탬프/포즈
         t = m.header.stamp.sec + m.header.stamp.nanosec*1e-9
         p = np.array([m.pose.pose.position.x,
                       m.pose.pose.position.y,
                       m.pose.pose.position.z], dtype=float)
         q = quat_to_np(m.pose.pose.orientation)
 
-        # ★ NEW: Carto 첫 프레임로 EKF 초기화(bootstrap)
+        # --- 초기화 ---
         if not self.initialized:
             self.ekf.set_init_state({"pos": p.tolist(),
                                      "vel": [0.0, 0.0, 0.0],
                                      "rot": q.tolist(),
                                      "stamp": t})
-            # 초기 P를 약간 키워 Carto를 더 수용
-            self.ekf.P[0:3,0:3] *= 10.0      # 위치
-            self.ekf.P[6:9,6:9] *= 10.0      # 자세(소각)
+            # 초기 P 약간 키움
+            self.ekf.P[0:3,0:3] *= 10.0
+            self.ekf.P[6:9,6:9] *= 10.0
             self.initialized = True
             self.carto_seen = 0
             self.get_logger().info("EKF initialized from first Carto pose")
-            return  # 첫 프레임은 업데이트 스킵
+            return
 
-        # ★ NEW: 초기 N프레임 스킵
+        # --- 초기 N프레임 스킵 ---
         self.carto_seen += 1
         if self.carto_seen <= self.carto_boot_skip:
             return
 
-        # ★ NEW: 쿨다운 중이면 스킵
+        # --- 쿨다운 체크 ---
         now = self.get_clock().now().nanoseconds*1e-9
         if now < self.skip_until_sec:
             return
 
-        # ★ NEW: 웜업 기간에는 R/임계치 완화
-        elapsed = (now - self.start_sec) if (self.start_sec is not None) else 999.0
-        Rp = self.Rp.copy()
-        Rth= self.Rth.copy()
+        # --- 기본 R 세팅 ---
+        Rp  = self.Rp.copy()
+        Rth = self.Rth.copy()
         chi2 = self.chi2_thresh
         amax = self.alpha_max
+
+        # 웜업 동안 인플레이트
+        elapsed = (now - self.start_sec) if (self.start_sec is not None) else 999.0
         if elapsed < self.warmup_sec:
             Rp  *= 5.0
             Rth *= 5.0
-            chi2 = max(self.chi2_thresh, 30.0)
-            amax = max(self.alpha_max, 100.0)
+            chi2 = max(chi2, 40.0)
+            amax = max(amax, 100.0)
 
+        # --- 메시지 공분산 사용: 0이면 무시 ---
         if self.use_carto_cov_from_msg:
-            C6 = _cov6_from_odom(m)
-            if C6 is not None:
+            C6 = _cov6_from_odom(m)  # ★ 위에서 강화한 함수
+            if C6 is None:
+                # 모두 0이거나 비정상 → 디폴트 사용
+                self.get_logger().warn("Carto covariance invalid/zero → using default Rp/Rθ")
+            else:
                 Rp  = C6[:3,:3]
                 Rth = C6[3:,3:]
 
@@ -224,11 +246,13 @@ class OdomFusionEkfNode(Node):
                 p_meas=p, q_meas=q,
                 R_p=Rp, R_theta=Rth,
                 chi2_thresh=chi2, alpha_max=amax,
-                skip_thresh=self.skip_thresh   
+                skip_thresh=self.skip_thresh
             )
             if lam > self.skip_thresh:
                 self.skip_until_sec = now + self.cooldown_sec
-                self.get_logger().warn(f"Carto pose skipped: λ={lam:.1f} (cooldown {self.cooldown_sec:.2f}s)")
+                self.get_logger().warn(
+                    f"Carto pose skipped: λ={lam:.1f} (cooldown {self.cooldown_sec:.2f}s)"
+                )
             elif lam > chi2:
                 self.get_logger().warn(f"Carto pose gated/inflated. Mahalanobis={lam:.2f}")
         except Exception as e:
@@ -236,6 +260,7 @@ class OdomFusionEkfNode(Node):
             return
 
         self._EKF_publisher()
+
 
     # ---------- publish ----------
     def _EKF_publisher(self):
