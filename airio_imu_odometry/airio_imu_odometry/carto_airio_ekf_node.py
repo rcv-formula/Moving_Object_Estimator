@@ -68,19 +68,30 @@ class OdomFusionEkfNode(Node):
         self.last_eta_v = np.array([0.05,0.05,0.05], float)  # AirIO 속도 불확실도 기본
         self.deadband_ms = 5.0
 
+    def _diag3_from_cov(cov_list):
+        # cov_list: 9개 원소의 row-major 3x3
+        if cov_list is None or len(cov_list) != 9:
+            return None
+        d0, d1, d2 = float(cov_list[0]), float(cov_list[4]), float(cov_list[8])
+        # ROS 규약: -1 은 unknown
+        if d0 < 0.0 or d1 < 0.0 or d2 < 0.0:
+            return None
+        return (d0, d1, d2)
+
     # ---------- callbacks ----------
     def cb_imu(self, m: Imu):
-        # 보정된 IMU가 들어온다고 가정 (AirIMU 노드에서 publish)
         stamp = m.header.stamp.sec + m.header.stamp.nanosec*1e-9
 
         if not self.initialized:
-            # 초기 상태는 Cartographer 또는 /odom_airio 수신 시 세팅하는 것을 권장
             self.ekf.set_init_state({
                 "pos":[0,0,0], "vel":[0,0,0], "rot":[0,0,0,1], "stamp":stamp
             })
             self.initialized = True
 
         try:
+            gyro_var = self._diag3_from_cov(m.angular_velocity_covariance)
+            acc_var  = self._diag3_from_cov(m.linear_acceleration_covariance)
+
             self.ekf.add_imu(
                 ImuSample(
                     wx=float(m.angular_velocity.x),
@@ -91,7 +102,8 @@ class OdomFusionEkfNode(Node):
                     az=float(m.linear_acceleration.z),
                     stamp=float(stamp)
                 ),
-                gyro_var=None, acc_var=None,  
+                gyro_var=gyro_var,
+                acc_var=gyro_var,
             )
         except Exception as e:
             self.get_logger().warn(f"EKF predict failed: {e}")
@@ -100,23 +112,21 @@ class OdomFusionEkfNode(Node):
         self._EKF_publisher()
 
     def cb_airio(self, m: Odometry):
-        # AirIO 오도메트리: twist.linear는 world frame이라고 가정
         try:
             v_w = np.array([m.twist.twist.linear.x,
                             m.twist.twist.linear.y,
                             m.twist.twist.linear.z], dtype=float)
-            # 바디 프레임 속도로 변환해서 업데이트(기본)
+
             if self.use_body_vel_update:
                 q = self.ekf.get_state()["rot"]
                 Rwb = rot_from_quat(np.asarray(q, float))
                 v_b = Rwb.T @ v_w
-                # 데드밴드
+
                 if np.linalg.norm(v_b)*1000.0 < self.deadband_ms:
                     v_b[:] = 0.0
                 Rm = np.diag(self.last_eta_v**2)  # 필요시 토픽으로 받아 반영
                 self.ekf.update_velocity_body(tuple(v_b.tolist()), Rm)
             else:
-                # 월드 속도 직접 업데이트 하려면 ekf에 별도 메서드가 있어야 함
                 pass
         except Exception as e:
             self.get_logger().warn(f"AirIO velocity update failed: {e}")
@@ -124,7 +134,6 @@ class OdomFusionEkfNode(Node):
         self._EKF_publisher()
 
     def cb_carto(self, m: Odometry):
-        # Cartographer pose 측정: 게이팅 + 적응 R
         try:
             p = np.array([m.pose.pose.position.x,
                           m.pose.pose.position.y,
@@ -136,7 +145,6 @@ class OdomFusionEkfNode(Node):
                 R_p=self.Rp, R_theta=self.Rth,
                 chi2_thresh=self.chi2_thresh, alpha_max=self.alpha_max
             )
-            # lam을 로깅하면 튐 감지에 유용
             if lam > self.chi2_thresh:
                 self.get_logger().warn(f"Carto pose gated/inflated. Mahalanobis={lam:.2f}")
         except Exception as e:
