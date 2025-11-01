@@ -91,9 +91,7 @@ class OdomFusionEkfNode(Node):
                     az=float(m.linear_acceleration.z),
                     stamp=float(stamp)
                 ),
-                gyro_var=None, acc_var=None,  # AirIMU 분산을 별도로 보내고 싶으면 메시지 확장 필요
-                # 핵심: 보정된 IMU이므로 bias 차감 금지
-                inputs_are_corrected=True
+                gyro_var=None, acc_var=None,  
             )
         except Exception as e:
             self.get_logger().warn(f"EKF predict failed: {e}")

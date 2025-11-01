@@ -308,6 +308,19 @@ class AirIoImuOdomNode(Node):
         imu_msg.orientation.y = float(imu_out.qy)
         imu_msg.orientation.z = float(imu_out.qz)
         imu_msg.orientation.w = float(imu_out.qw)
+        # 공분산 관련 update
+        gyro_var = imu_out.gyro_var
+        acc_var = imu_out.acc_var
+        imu_msg.linear_acceleration_covariance = [
+            float(acc_var[0]), 0.0, 0.0,
+            0.0, float(acc_var[1]), 0.0,
+            0.0, 0.0, float(acc_var[2])
+        ]
+        imu_msg.angular_velocity_covariance = [
+        float(gyro_var[0]), 0.0, 0.0,
+        0.0, float(gyro_var[1]), 0.0,
+        0.0, 0.0, float(gyro_var[2])
+        ]
         self.filtered_pub.publish(imu_msg)
         
         # publish odom (frame=map) — EKF 상태 직결
