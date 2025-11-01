@@ -244,12 +244,15 @@ class OdomFusionEkfNode(Node):
         if self.use_carto_cov_from_msg:
             C6 = _cov6_from_odom(m)  # ★ 위에서 강화한 함수
             if C6 is None:
+                
                 # 모두 0이거나 비정상 → 디폴트 사용
                 self.get_logger().warn("Carto covariance invalid/zero → using default Rp/Rθ")
             else:
                 Rp  = C6[:3,:3]
                 Rth = C6[3:,3:]
 
+        Rp  = np.diag([0.05, 0.05, 0.10])               
+        Rth = np.diag([np.deg2rad(1)**2]*3)             
         try:
             lam = self.ekf.update_pose_world_adaptive(
                 p_meas=p, q_meas=q,
