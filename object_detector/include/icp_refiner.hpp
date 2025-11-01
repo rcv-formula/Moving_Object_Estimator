@@ -29,7 +29,7 @@ struct IcpParams {
       voxel_leaf(0.2f),
       use_downsample(true),
       reject_far(false),
-      reject_radius(3.0f) {}
+      reject_radius(3.0f){}
 };
 
 class IcpRefiner {

@@ -61,8 +61,8 @@ class ImuSample:
 class EkfParams:
     gyro_noise: float = 0.02       # [rad/s]   (기본 표준편차)
     acc_noise: float  = 0.20       # [m/s^2]   (기본 표준편차)
-    gyro_bias_rw: float = 5e-4     # [rad/s^2]^0.5  (랜덤워크 표준편차)
-    acc_bias_rw:  float = 5e-3     # [m/s^3]^0.5    (랜덤워크 표준편차)
+    gyro_bias_rw: float = 0.0    # [rad/s^2]^0.5  (랜덤워크 표준편차)
+    acc_bias_rw:  float = 0.0     # [m/s^3]^0.5    (랜덤워크 표준편차)
     gravity: float = 9.81007
 
 class AirIOEKFWrapper:
@@ -70,7 +70,7 @@ class AirIOEKFWrapper:
     Tries to load Air-IO repo EKF if available; otherwise uses a light 15-state EKF.
     State: [p(3), v(3), q(xyzw), bg(3), ba(3)], covariance on [p v theta bg ba] (15x15).
 
-    변경점(4번): add_imu(...)가 per-sample gyro/acc 분산(variance)을 입력으로 받아
+    add_imu(...)가 per-sample gyro/acc 분산(variance)을 입력으로 받아
     전파 잡음 공분산 Q에 반영하도록 확장.
     """
     def __init__(self, airio_root: str, use_repo: bool = True, params: Optional[EkfParams] = None):

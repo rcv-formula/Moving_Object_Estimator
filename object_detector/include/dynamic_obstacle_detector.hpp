@@ -1,406 +1,302 @@
 #pragma once
+/**
+ * @file dynamic_obstacle_detector.hpp
+ * @brief 로컬-맵 정렬된 과거 프레임을 관리/시각화하고, footprint 기반 동적/정적 판정을 수행하는 보조 클래스
+ *
+ * 제공 기능:
+ *  - transformObjHistoryToCurrentFrames(obj_pairs, current_pose):
+ *      과거 오브젝트 점들을 현재 프레임(=현재 포즈 기준 로컬 좌표계)로 변환하여 프레임별 점 리스트 반환
+ *  - publishAlignedFramesMarkers(aligned_frames, frame_id, stamp, pub, point_scale, alpha):
+ *      정렬된 과거 오브젝트 프레임들을 MarkerArray로 시각화
+ *  - classifyDynamicByFootprint(target, aligned_frames, eps, minPts, search_radius, exclude_current, motion_thresh, out_footprint, out_span):
+ *      현재 타깃과 **반경 내에서 수집된 과거 프레임 점들** 사이의 최대 거리로 동적(1)/정적(0) 분류.
+ *      단, 반경 내에서 실제로 수집된 **서로 다른 과거 프레임 수 ≤ 5**이면 UNKNOWN(-1).
+ *  - visualizeFootprint(footprint, label, frame_id, id, stamp, pub):
+ *      footprint를 MarkerArray로 시각화
+ */
+
+#include <functional>
 #include <vector>
-#include <algorithm>
 #include <cmath>
-#include <memory>
 #include <limits>
+#include <memory>
+#include <algorithm>
+#include <unordered_set>
 
+#include <Eigen/Dense>
+
+#include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
-#include <pcl/filters/voxel_grid.h>
-#include <pcl/kdtree/kdtree_flann.h>
-
-#include "map_manager_pair.hpp"
+#include <visualization_msgs/msg/marker_array.hpp>
 
 class DynamicObjectDetector {
 public:
+  // 라벨 정의: UNKNOWN=0, STATIC=1, DYNAMIC=2
+  enum Label { UNKNOWN=0, STATIC=1, DYNAMIC=2 };
 
   DynamicObjectDetector() = default;
 
-  void set_threshold1(double v)        { threshold1_ = std::max(0.0, v); }
-  void set_threshold2(double v)        { threshold2_ = std::max(0.0, v); }
-  void set_target_frame_idx(int idx)   { target_frame_idx_ = idx; }
-
-  double threshold1() const            { return threshold1_; }
-  double threshold2() const            { return threshold2_; }
-  int    target_frame_idx() const      { return target_frame_idx_; }
-
-  inline Eigen::Matrix4d poseToMatrix(const geometry_msgs::msg::Pose& p) {
-    Eigen::Quaterniond q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
-    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
-    T.block<3,3>(0,0) = q.normalized().toRotationMatrix();
-    T(0,3) = p.position.x;
-    T(1,3) = p.position.y;
-    T(2,3) = p.position.z;
-    return T;
-  }
-
-  inline std::vector<std::vector<geometry_msgs::msg::PointStamped>>
+  // === 과거 obj (map 좌표) → 현재 프레임(현재 포즈 기준 로컬 좌표)로 정렬 ===
+  std::vector<std::vector<geometry_msgs::msg::Point>>
   transformObjHistoryToCurrentFrames(
-      const std::vector<std::pair<std::vector<geometry_msgs::msg::PointStamped>, geometry_msgs::msg::Pose>>& deque_snapshot_obj_pairs,
-      const geometry_msgs::msg::Pose& current_pose)
+      const std::vector<std::pair<std::vector<geometry_msgs::msg::PointStamped>, geometry_msgs::msg::Pose>>& pairs_obj,
+      const geometry_msgs::msg::Pose& current_pose_map) const
   {
-    std::vector<std::vector<geometry_msgs::msg::PointStamped>> out;
-    out.reserve(deque_snapshot_obj_pairs.size());
+    std::vector<std::vector<geometry_msgs::msg::Point>> out;
+    out.reserve(pairs_obj.size());
 
-    // current(map) 변환: map->current, so current->map is inverse
-    const Eigen::Matrix4d T_map_curr = poseToMatrix(current_pose);
-    const Eigen::Matrix4d T_curr_map = T_map_curr.inverse();
+    const Eigen::Matrix4d T_map_curr = poseToT(current_pose_map); // map->curr
+    const Eigen::Matrix4d T_curr_map = T_map_curr.inverse();      // curr->map
 
-    for (const auto& pr : deque_snapshot_obj_pairs) {
-      const auto& frame_pts  = pr.first;   // 과거 프레임의 로컬 점들
-      const auto& hist_pose  = pr.second;  // 그 프레임이 찍힐 당시의 pose (map 기준)
+    for (const auto& pair : pairs_obj) {
+      const auto& pts  = pair.first;  // map 좌표에 있는 과거 점들
 
-      // hist(local) -> map
-      const Eigen::Matrix4d T_map_hist  = poseToMatrix(hist_pose);
-      // hist(local) -> current
-      const Eigen::Matrix4d T_curr_hist = T_curr_map * T_map_hist;
+      std::vector<geometry_msgs::msg::Point> transformed;
+      transformed.reserve(pts.size());
 
-      std::vector<geometry_msgs::msg::PointStamped> frame_out;
-      frame_out.reserve(frame_pts.size());
-
-      for (const auto& ps : frame_pts) {
-        // ps.point 는 "그때의 로컬 프레임" 좌표라고 가정
-        Eigen::Vector4d p_hist(ps.point.x, ps.point.y, ps.point.z, 1.0);
-        Eigen::Vector4d p_curr = T_curr_hist * p_hist;
-
-        geometry_msgs::msg::PointStamped ps_out;
-        ps_out.header.stamp = ps.header.stamp;     // 타임스탬프는 원본 유지(원하면 현재로 바꿔도 무방)
-        // ps_out.header.frame_id 는 여기서 비워두고, 시각화 시 Marker의 frame_id로 지정하는 걸 권장
-        ps_out.point.x = p_curr.x();
-        ps_out.point.y = p_curr.y();
-        ps_out.point.z = p_curr.z();
-
-        frame_out.emplace_back(std::move(ps_out));
+      for (const auto& ps : pts) {
+        Eigen::Vector4d pw(ps.point.x, ps.point.y, ps.point.z, 1.0); // map
+        Eigen::Vector4d pc = T_curr_map * pw;                        // curr(frame)
+        geometry_msgs::msg::Point p; p.x = pc.x(); p.y = pc.y(); p.z = pc.z();
+        transformed.push_back(p);
       }
-      out.emplace_back(std::move(frame_out));
+      out.push_back(std::move(transformed));
     }
     return out;
   }
 
-  inline void publishAlignedFramesMarkers(
-      const std::vector<std::vector<geometry_msgs::msg::PointStamped>> &aligned_frames,
-      const std::string &frame_id,
-      const rclcpp::Time &stamp,
-      const rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr &pub,
+  // === 정렬된 과거 프레임 점들을 RViz Marker로 시각화 ===
+  void publishAlignedFramesMarkers(
+      const std::vector<std::vector<geometry_msgs::msg::Point>>& aligned_frames,
+      const std::string& frame_id,
+      const builtin_interfaces::msg::Time& stamp,
+      const rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr& pub,
       double point_scale = 0.06,
-      double lifetime_sec = 0.25) const
+      double alpha = 0.15) const
   {
-    if (!pub || aligned_frames.empty()) return;
+    if (!pub) return;
 
     visualization_msgs::msg::MarkerArray arr;
 
-    // 기존 마커 지우기
+    // DELETEALL
     {
       visualization_msgs::msg::Marker del;
       del.header.frame_id = frame_id;
       del.header.stamp    = stamp;
-      del.ns              = "aligned_frames";
-      del.id              = 0;
-      del.action          = visualization_msgs::msg::Marker::DELETEALL;
+      del.ns   = "aligned_obj_history";
+      del.id   = 0;
+      del.action = visualization_msgs::msg::Marker::DELETEALL;
       arr.markers.push_back(del);
     }
 
-    const int N = static_cast<int>(aligned_frames.size());
-    int next_id = 1;
-
-    for (int i = 0; i < N; ++i) {
-      const auto &frame_pts = aligned_frames[i];
-      if (frame_pts.empty()) continue;
-
+    // SPHERE_LIST per frame
+    for (size_t i = 0; i < aligned_frames.size(); ++i) {
       visualization_msgs::msg::Marker m;
       m.header.frame_id = frame_id;
       m.header.stamp    = stamp;
-      m.ns              = "aligned_frames";
-      m.id              = next_id++;
-      m.type            = visualization_msgs::msg::Marker::SPHERE_LIST;
-      m.action          = visualization_msgs::msg::Marker::ADD;
-      m.scale.x = m.scale.y = m.scale.z = point_scale;
+      m.ns   = "aligned_obj_history";
+      m.id   = static_cast<int>(i + 1);
+      m.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+      m.action = visualization_msgs::msg::Marker::ADD;
+      m.scale.x = point_scale; m.scale.y = point_scale; m.scale.z = point_scale;
 
-      // 오래된 프레임일수록 어둡게: hue는 고정하고 value만 낮춤(또는 hue를 프레임별로 바꿔도 됨)
-      // 여기서는 hue를 프레임별로 조금씩 변화 + 밝기는 (i/N)로 점점 어둡게
-      float r=1, g=1, b=1;
-      double hue = ( (N > 1) ? (static_cast<double>(i) / (N-1)) : 0.0 ); // 0~1
-      double val = 0.95 * (0.35 + 0.65 * (1.0 - static_cast<double>(i)/std::max(1, N-1))); // 최신이 더 밝게
-      hsvToRgb(hue, 0.9, val, r, g, b);
-      m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 0.95f;
+      float r, g, b;
+      hsvToRgb(static_cast<float>((i % 12) / 12.0), 0.8f, 0.9f, r, g, b);
+      m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = static_cast<float>(alpha);
 
-      // 점들 채우기
-      m.points.reserve(frame_pts.size());
-      for (const auto &ps : frame_pts) {
-        geometry_msgs::msg::Point p;
-        p.x = ps.point.x; p.y = ps.point.y; p.z = ps.point.z;
-        m.points.push_back(p);
-      }
-
-      m.lifetime = rclcpp::Duration::from_seconds(lifetime_sec);
+      for (const auto& p : aligned_frames[i]) m.points.push_back(p);
       arr.markers.push_back(m);
-
-      // 프레임 인덱스 텍스트(선택)
-      visualization_msgs::msg::Marker t;
-      t.header.frame_id = frame_id;
-      t.header.stamp    = stamp;
-      t.ns              = "aligned_frames_text";
-      t.id              = next_id++;
-      t.type            = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-      t.action          = visualization_msgs::msg::Marker::ADD;
-      t.scale.z         = point_scale * 3.0;
-      t.color.r = t.color.g = t.color.b = 1.0f; t.color.a = 0.9f;
-
-      // 레이블은 프레임 중앙 근처에 표시
-      geometry_msgs::msg::Point center{};
-      for (const auto &ps : frame_pts) { center.x += ps.point.x; center.y += ps.point.y; center.z += ps.point.z; }
-      center.x /= frame_pts.size(); center.y /= frame_pts.size(); center.z /= frame_pts.size();
-      center.z += point_scale * 2.0; // 살짝 위
-      t.pose.position = center;
-
-      char buf[64];
-      std::snprintf(buf, sizeof(buf), "frame %d/%d", i, N-1);
-      t.text = buf;
-      t.lifetime = rclcpp::Duration::from_seconds(lifetime_sec);
-      arr.markers.push_back(t);
     }
 
     pub->publish(arr);
   }
-  
-  inline void visualizeFootprint(
-    const std::vector<geometry_msgs::msg::Point>& footprint,
-    int dyn_label,  // 0: static, 1: dynamic
-    const std::string& frame_id,
-    int id,
-    const rclcpp::Time& stamp,
-    const rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr& publisher)
+
+  /**
+   * @brief footprint 기반 분류 (UNKNOWN=-1, STATIC=0, DYNAMIC=1)
+   *
+   * 절차(현재↔과거 최대거리 + 반경 내 과거 프레임 수 검증):
+   *  1) `aligned_frames`의 마지막 인덱스를 현재 프레임으로 가정.
+   *  2) target(현재 프레임 좌표계) 주변 `search_radius` 내 footprint 점 수집.
+   *  3) footprint 중 **서로 다른 과거 프레임 인덱스**의 개수를 센다(현재 프레임 제외).
+   *     - 이 개수가 **5 이하**이면 UNKNOWN(-1) 반환.
+   *  4) 과거 프레임 점들과 target 사이의 **최대 거리(move_max)** 계산.
+   *     - `move_max >= motion_thresh` → DYNAMIC(1), 아니면 STATIC(0).
+   *  5) `out_span`은 footprint의 x범위(max−min)를 반환(분류에는 미사용).
+   */
+  int classifyDynamicByFootprint(
+      const geometry_msgs::msg::Point& target_in_current,
+      const std::vector<std::vector<geometry_msgs::msg::Point>>& aligned_frames,
+      double eps,                 // (미사용)
+      int /*minPts*/,             // (미사용)
+      double search_radius,
+      bool   /*exclude_current*/, // (미사용)
+      double motion_thresh,
+      std::vector<geometry_msgs::msg::Point>* out_footprint,
+      double* out_span) const
   {
-    if (!publisher || footprint.empty()) return;
+    (void)eps;
+    if (aligned_frames.empty()) return UNKNOWN;
+
+    const int current_idx = static_cast<int>(aligned_frames.size()) - 1;
+
+    // (B) 반경 내 footprint 수집 (프레임 인덱스 포함)
+    std::vector<std::pair<geometry_msgs::msg::Point, int>> footprint_idx; // (점, 프레임인덱스)
+    const double R2 = search_radius * search_radius;
+    for (size_t f = 0; f < aligned_frames.size(); ++f) {
+      for (const auto& p : aligned_frames[f]) {
+        const double dx = p.x - target_in_current.x;
+        const double dy = p.y - target_in_current.y;
+        const double dz = p.z - target_in_current.z;
+        const double d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 <= R2) footprint_idx.emplace_back(p, static_cast<int>(f));
+      }
+    }
+
+    if (out_footprint) {
+      out_footprint->clear();
+      out_footprint->reserve(footprint_idx.size());
+      for (const auto& kv : footprint_idx) out_footprint->push_back(kv.first);
+    }
+
+    if (out_span) {
+      if (footprint_idx.empty()) *out_span = 0.0;
+      else {
+        double xmin=+1e9, xmax=-1e9;
+        for (const auto& kv : footprint_idx) {
+          xmin = std::min(xmin, kv.first.x);
+          xmax = std::max(xmax, kv.first.x);
+        }
+        *out_span = (xmax - xmin);
+      }
+    }
+
+    // (C) 반경 내 footprint가 포함하는 **서로 다른 과거 프레임 수** 계산
+    std::unordered_set<int> past_frames_in_footprint;
+    for (const auto& kv : footprint_idx) {
+      const int f = kv.second;
+      if (f != current_idx) past_frames_in_footprint.insert(f);
+    }
+    // 과거 프레임 수가 2개 이하라면 UNKNOWN
+    if (static_cast<int>(past_frames_in_footprint.size()) <= 3) {
+      return UNKNOWN;
+    }
+
+    // (D) 현재 타깃 ↔ 과거 프레임 점들 간 최대 거리
+    double move_sum = 0.0;
+    double move_avg = 0.0;
+    bool   found_past = false;
+    std::vector<double> dist_vec;
+    
+    for (const auto& kv : footprint_idx) {
+      const int f = kv.second;
+      if (f == current_idx) continue;  // 과거만 확인
+      const auto& p = kv.first;
+      const double d = hypot3(p, target_in_current);
+      dist_vec.emplace_back(d);
+      found_past = true;
+    }
+    
+    if (!found_past) {
+      // 반경 내 점이 모두 현재 프레임뿐이면 과거 대비가 불가 → UNKNOWN이 타당
+      return UNKNOWN;
+    }
+
+    std::sort(dist_vec.begin(),dist_vec.end(),std::greater<double>());
+
+    if(dist_vec.size() >= 3 && dist_vec[0] < motion_thresh && dist_vec[1] < motion_thresh) return STATIC;
+
+    return DYNAMIC;
+  }
+
+  // === footprint 시각화 ===
+  void visualizeFootprint(
+      const std::vector<geometry_msgs::msg::Point>& footprint,
+      int dyn_label,                         // -1=unknown, 0=static, 1=dynamic
+      const std::string& frame_id,
+      int id_base,
+      const builtin_interfaces::msg::Time& stamp,
+      const rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr& pub) const
+  {
+    if (!pub) return;
 
     visualization_msgs::msg::MarkerArray arr;
 
-    // ===== Line Strip =====
-    visualization_msgs::msg::Marker line;
-    line.header.frame_id = frame_id;
-    line.header.stamp = stamp;
-    line.ns = "footprint_line";
-    line.id = id;
-    line.type = visualization_msgs::msg::Marker::LINE_STRIP;
-    line.action = visualization_msgs::msg::Marker::ADD;
-    line.pose.orientation.w = 1.0;
-    line.scale.x = 0.03;  // line width
-    line.lifetime = rclcpp::Duration::from_seconds(0.5); // 실시간 갱신용 (0으로 하면 영구 표시)
-
-    // 색상 설정
-    if (dyn_label == 0) { // STATIC
-      line.color.r = 0.0f;
-      line.color.g = 1.0f;
-      line.color.b = 0.0f;
-      line.color.a = 0.8f;
-    } else { // DYNAMIC
-      line.color.r = 1.0f;
-      line.color.g = 0.0f;
-      line.color.b = 0.0f;
-      line.color.a = 0.9f;
-    }
-
-    // footprint 점 연결
-    for (const auto& p : footprint)
-      line.points.push_back(p);
-
-    // 폐곡선 처리 (선택)
-    if (footprint.size() > 2)
-      line.points.push_back(footprint.front());
-
-    // ===== Sphere List =====
-    visualization_msgs::msg::Marker spheres = line;
-    spheres.ns = "footprint_points";
-    spheres.id = id + 10000;
-    spheres.type = visualization_msgs::msg::Marker::SPHERE_LIST;
-    spheres.scale.x = 0.06;
-    spheres.scale.y = 0.06;
-    spheres.scale.z = 0.06;
-    spheres.points = footprint;
-
-    // ===== Array 발행 =====
-    arr.markers.push_back(line);
-    arr.markers.push_back(spheres);
-    publisher->publish(arr);
-  }
-
-  inline std::vector<geometry_msgs::msg::Point>
-  extractNearestCluster(
-      const geometry_msgs::msg::Point& obj,
-      const std::vector<std::vector<geometry_msgs::msg::PointStamped>>& aligned_frames,
-      double eps = 0.12,          // DBSCAN half-width
-      int    minPts = 3,          // DBSCAN min points
-      double search_radius = 0.40,// 후보 탐색 반경(성능/오류 완화)
-      bool   exclude_current = true,
-      int    required_distinct_frames = 5
-  ) const
-  {
-    struct P2 { double x, y; int f; };     // f: frame index 추가
-    std::vector<P2> pool; pool.reserve(1024);
-    if (aligned_frames.empty()) return {};
-
-    // 1) obj 주변 search_radius 안의 포인트만 모아서 후보 풀 구성 (+ 최소 3개 프레임 조건)
-    const double R2 = search_radius * search_radius;
-    const int last = static_cast<int>(aligned_frames.size()) - 1;
-    const int end_idx = exclude_current ? last : last + 1; // 현재 프레임 제외 여부
-
-    for (int i = 0; i < end_idx; ++i) {
-      for (const auto& ps : aligned_frames[i]) {
-        const double dx = ps.point.x - obj.x;
-        const double dy = ps.point.y - obj.y;
-        if (!std::isfinite(dx) || !std::isfinite(dy)) continue;
-        if (dx*dx + dy*dy <= R2) pool.push_back({ps.point.x, ps.point.y, i});
-      }
-    }
-    if (pool.size() < static_cast<size_t>(minPts)) return {};
-
-    // 후보 풀에 기여한 고유 프레임 수 확인 (3개 미만이면 즉시 탈락)
+    // 포인트 구름
     {
-      int max_frames = std::max(1, end_idx);               // 안전 처리
-      std::vector<char> seen(max_frames, 0);
-      int distinct = 0;
-      for (const auto& p : pool) {
-        if (p.f >= 0 && p.f < max_frames && !seen[p.f]) {
-          seen[p.f] = 1; distinct++;
-          if (distinct >= required_distinct_frames) break;
-        }
+      visualization_msgs::msg::Marker pts;
+      pts.header.frame_id = frame_id;
+      pts.header.stamp    = stamp;
+      pts.ns   = "footprint_points";
+      pts.id   = id_base;
+      pts.type = visualization_msgs::msg::Marker::SPHERE_LIST;
+      pts.action = visualization_msgs::msg::Marker::ADD;
+      pts.scale.x = 0.06; pts.scale.y = 0.06; pts.scale.z = 0.06;
+
+      if (dyn_label == DYNAMIC) {         // 빨강
+        pts.color.r = 1.0f; pts.color.g = 0.1f; pts.color.b = 0.1f; pts.color.a = 0.95f;
+      } else if (dyn_label == STATIC) {   // 파랑
+        pts.color.r = 0.1f; pts.color.g = 0.4f; pts.color.b = 1.0f; pts.color.a = 0.95f;
+      } else {                            // UNKNOWN = 노랑
+        pts.color.r = 1.0f; pts.color.g = 0.9f; pts.color.b = 0.1f; pts.color.a = 0.95f;
       }
-      if (distinct < required_distinct_frames) return {};  // 최소 3개 프레임 조건 불만족
+
+      for (const auto& p : footprint) pts.points.push_back(p);
+      pts.lifetime = rclcpp::Duration::from_seconds(0.25);
+      arr.markers.push_back(pts);
     }
 
-    // 2) DBSCAN (2D)
-    const double eps2 = eps * eps;
-    const int N = static_cast<int>(pool.size());
-    std::vector<int> labels(N, -1);  // -1: unvisited, -2: noise, >=0: cluster id
+    // 외곽선(Convex Hull 유사 라이트 버전: x 정렬 후 polyline)
+    if (footprint.size() >= 3) {
+      std::vector<geometry_msgs::msg::Point> hull = polylineByX(footprint);
 
-    auto regionQuery = [&](int i){
-      std::vector<int> nb; nb.reserve(32);
-      for (int j = 0; j < N; ++j) {
-        if (j == i) continue;
-        const double dx = pool[i].x - pool[j].x;
-        const double dy = pool[i].y - pool[j].y;
-        if (dx*dx + dy*dy <= eps2) nb.push_back(j);
-      }
-      return nb;
-    };
+      visualization_msgs::msg::Marker line;
+      line.header.frame_id = frame_id;
+      line.header.stamp    = stamp;
+      line.ns   = "footprint_outline";
+      line.id   = id_base + 10000;
+      line.type = visualization_msgs::msg::Marker::LINE_STRIP;
+      line.action = visualization_msgs::msg::Marker::ADD;
+      line.scale.x = 0.025;
 
-    int cid = 0;
-    for (int i = 0; i < N; ++i) {
-      if (labels[i] != -1) continue;
-      auto neigh = regionQuery(i);
-      if (static_cast<int>(neigh.size()) + 1 < minPts) { labels[i] = -2; continue; } // noise
-      labels[i] = cid;
-      std::vector<int> seeds = neigh;
-      for (size_t k = 0; k < seeds.size(); ++k) {
-        int j = seeds[k];
-        if (labels[j] == -2) labels[j] = cid;     // border → core
-        if (labels[j] != -1) continue;            // visited
-        labels[j] = cid;
-        auto neigh_j = regionQuery(j);
-        if (static_cast<int>(neigh_j.size()) + 1 >= minPts) {
-          seeds.insert(seeds.end(), neigh_j.begin(), neigh_j.end());
-        }
-      }
-      cid++;
+      // UNKNOWN은 회백색, 나머지는 흰색
+      if (dyn_label == UNKNOWN) { line.color.r = 0.8f; line.color.g = 0.8f; line.color.b = 0.8f; line.color.a = 0.8f; }
+      else                      { line.color.r = 0.95f; line.color.g = 0.95f; line.color.b = 0.95f; line.color.a = 0.8f; }
+
+      for (const auto& p : hull) line.points.push_back(p);
+      line.points.push_back(hull.front()); // 닫기
+      line.lifetime = rclcpp::Duration::from_seconds(0.25);
+      arr.markers.push_back(line);
     }
 
-    if (cid == 0) return {};
-
-    // 3) obj와 가장 가까운 클러스터 선택 (센트로이드 기준)
-    auto dist = [](double ax, double ay, double bx, double by){
-      const double dx = ax - bx, dy = ay - by;
-      return std::sqrt(dx*dx + dy*dy);
-    };
-
-    int best_c = -1;
-    double best_d = std::numeric_limits<double>::infinity();
-
-    for (int c = 0; c < cid; ++c) {
-      double sx=0.0, sy=0.0; int cnt=0;
-      for (int i = 0; i < N; ++i) if (labels[i] == c) { sx += pool[i].x; sy += pool[i].y; cnt++; }
-      if (cnt == 0) continue;
-      const double cx = sx / cnt, cy = sy / cnt;
-      const double d  = dist(cx, cy, obj.x, obj.y);
-      if (d < best_d) { best_d = d; best_c = c; }
-    }
-
-    if (best_c < 0) return {};
-
-    // 4) 선택된 클러스터의 포인트들을 geometry_msgs::msg::Point 로 반환
-    std::vector<geometry_msgs::msg::Point> cluster;
-    for (int i = 0; i < N; ++i) {
-      if (labels[i] != best_c) continue;
-      geometry_msgs::msg::Point p;
-      p.x = pool[i].x; p.y = pool[i].y; p.z = 0.0;
-      cluster.push_back(p);
-    }
-    return cluster;
+    pub->publish(arr);
   }
 
-  static inline double computeFootprintSpan(const std::vector<geometry_msgs::msg::Point>& cluster)
-  {
-    if (cluster.size() < 2) return std::numeric_limits<double>::quiet_NaN();
-
-    auto dist = [](const geometry_msgs::msg::Point& a, const geometry_msgs::msg::Point& b){
-      const double dx=a.x-b.x, dy=a.y-b.y, dz=a.z-b.z;
-      return std::sqrt(dx*dx + dy*dy + dz*dz);
-    };
-
-    // seed: 임의(0)
-    const size_t n = cluster.size();
-    size_t seed = 0;
-
-    // 1-pass: seed에서 가장 먼 점 A
-    size_t ia = seed; double da = -1.0;
-    for (size_t i=0;i<n;++i){
-      double d = dist(cluster[i], cluster[seed]);
-      if (d > da) { da = d; ia = i; }
-    }
-    // 2-pass: A에서 가장 먼 거리 = 근사 지름
-    double span = 0.0;
-    for (size_t i=0;i<n;++i){
-      double d = dist(cluster[i], cluster[ia]);
-      if (d > span) span = d;
-    }
-    return span;
-  }
-
-  inline int classifyDynamicByFootprint(
-      const geometry_msgs::msg::Point& obj,
-      const std::vector<std::vector<geometry_msgs::msg::PointStamped>>& aligned_frames,
-      double eps = 0.12,           // DBSCAN 반경
-      int    minPts = 3,           // DBSCAN 최소 포인트 수
-      double search_radius = 0.60, // obj 주변 후보 수집 반경
-      bool   exclude_current = true,
-      double motion_thresh = 0.10, // 10cm
-      std::vector<geometry_msgs::msg::Point>* out_cluster = nullptr,
-      double* out_span = nullptr
-  ) const
-  {
-    // 1) obj와 가장 가까운 과거 클러스터 추출
-    auto cluster = extractNearestCluster(obj, aligned_frames, eps, minPts, search_radius, exclude_current);
-    if (out_cluster) *out_cluster = cluster;
-    if (cluster.size() < static_cast<size_t>(minPts)) return -1;
-    
-    // 2) 발자취 span 계산
-    const double span = computeFootprintSpan(cluster);
-    if (out_span) *out_span = span;
-    if (!std::isfinite(span)) return -1;
-
-    // 3) 판정
-    return (span > motion_thresh) ? 1 : 0; // 1=dynamic, 0=static
-  }
-  
 private:
+  static Eigen::Matrix4d poseToT(const geometry_msgs::msg::Pose &pose)
+  {
+    Eigen::Quaterniond q(pose.orientation.w,
+                         pose.orientation.x,
+                         pose.orientation.y,
+                         pose.orientation.z);
+    q.normalize();
 
-  static inline void hsvToRgb(double h, double s, double v, float &r, float &g, float &b) {
-    double i = std::floor(h * 6.0);
-    double f = h * 6.0 - i;
-    double p = v * (1.0 - s);
-    double q = v * (1.0 - f * s);
-    double t = v * (1.0 - (1.0 - f) * s);
+    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+    T.block<3,3>(0,0) = q.toRotationMatrix();
+    T(0,3) = pose.position.x;
+    T(1,3) = pose.position.y;
+    T(2,3) = pose.position.z;
+    return T;
+  }
+
+  static void hsvToRgb(float h, float s, float v, float& r, float& g, float& b)
+  {
+    float i = std::floor(h * 6.0f);
+    float f = h * 6.0f - i;
+    float p = v * (1.0f - s);
+    float q = v * (1.0f - f * s);
+    float t = v * (1.0f - (1.0f - f) * s);
     switch (static_cast<int>(i) % 6) {
       case 0: r = v; g = t; b = p; break;
       case 1: r = q; g = v; b = p; break;
@@ -411,7 +307,43 @@ private:
     }
   }
 
-  double threshold1_{0.05};  // [m] 예: 아주 근접 (정적/정합으로 간주)
-  double threshold2_{0.1};  // [m] 예: 경계 구간 상한 
-  int    target_frame_idx_{5}; //default는 5 이전의 frame
+  static double hypot3(const geometry_msgs::msg::Point& a, const geometry_msgs::msg::Point& b)
+  {
+    const double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+    return std::sqrt(dx*dx + dy*dy + dz*dz);
+  }
+
+  static std::vector<geometry_msgs::msg::Point>
+  polylineByX(const std::vector<geometry_msgs::msg::Point>& pts)
+  {
+    std::vector<geometry_msgs::msg::Point> v = pts;
+    std::sort(v.begin(), v.end(), [](const auto& a, const auto& b){ return a.x < b.x; });
+    if (v.size() < 3) return v;
+
+    // 상단 껍질
+    std::vector<geometry_msgs::msg::Point> up;
+    for (const auto& p : v) {
+      while (up.size() >= 2 && cross(up[up.size()-2], up.back(), p) <= 0.0) up.pop_back();
+      up.push_back(p);
+    }
+    // 하단 껍질
+    std::vector<geometry_msgs::msg::Point> lo;
+    for (int i = static_cast<int>(v.size()) - 1; i >= 0; --i) {
+      const auto& p = v[i];
+      while (lo.size() >= 2 && cross(lo[lo.size()-2], lo.back(), p) <= 0.0) lo.pop_back();
+      lo.push_back(p);
+    }
+    // 병합(마지막 중복 제거)
+    up.pop_back();
+    lo.pop_back();
+    up.insert(up.end(), lo.begin(), lo.end());
+    return up;
+  }
+
+  static double cross(const geometry_msgs::msg::Point& a,
+                      const geometry_msgs::msg::Point& b,
+                      const geometry_msgs::msg::Point& c)
+  {
+    return (b.x - a.x)*(c.y - a.y) - (b.y - a.y)*(c.x - a.x);
+  }
 };

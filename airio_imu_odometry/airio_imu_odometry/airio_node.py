@@ -255,6 +255,7 @@ class AirIoImuOdomNode(Node):
     def imu_callback(self, msg: Imu):
         if not self.initialized:
             return
+        
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         self.imu_sec = msg.header.stamp.sec
         self.imu_nanosec = msg.header.stamp.nanosec
@@ -270,13 +271,6 @@ class AirIoImuOdomNode(Node):
         with self.sample_lock:
             self.corrector.add_sample(imu_in)
             self.airio.add_sample(imu_in)
-
-        # 정지 판정용 히스토리 기록(가벼운 계산) — 비활성화
-        # gx, gy, gz = msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z
-        # ax, ay, az = msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z
-        # gyro_norm = float(np.linalg.norm([gx, gy, gz]))
-        # acc_norm  = float(np.linalg.norm([ax, ay, az]) - self.gravity)
-        # self._imu_hist.append((stamp, gyro_norm, abs(acc_norm)))
 
         # ====== seqlen 샘플마다 처리 트리거 ======
         self.samples_since_proc += 1
@@ -316,19 +310,11 @@ class AirIoImuOdomNode(Node):
         if not self.initialized:
             return
 
-        self.proc_count += 1  # 디커플링 카운터
-        t0 = time.time()
-
-        # 최신 보정값
-        imu_out = self.corrector.correct_latest()
-        if imu_out is None:
-            return
-        airimu_step_t = time.time() - t0
-
-        # === 재정렬 요청 반영 (통합기 제거된 버전: EKF/모듈만 리셋) ===
+        # === 재정렬 요청 반영 (EKF/모듈만 리셋) ===
         with self._realign_lock:
             req = self._realign_req
             self._realign_req = None
+
         if req is not None:
             try:
                 self.init_state = {
@@ -346,6 +332,19 @@ class AirIoImuOdomNode(Node):
                     self.corrector.set_init_state(self.init_state)
             except Exception as e:
                 self.get_logger().error(f"Realign failed: {e}")
+            
+            # publish carto & 바로 종료
+            self._publish_ekf_state_if_due()
+            return
+        
+        self.proc_count += 1  # 디커플링 카운터
+        t0 = time.time()
+
+        # 최신 보정값
+        imu_out = self.corrector.correct_latest()
+        if imu_out is None:
+            return
+        airimu_step_t = time.time() - t0
 
         # === EKF PROPAGATION (보정 IMU 사용) ===
         try:
@@ -353,14 +352,15 @@ class AirIoImuOdomNode(Node):
                 wx=float(imu_out.wx), wy=float(imu_out.wy), wz=float(imu_out.wz),
                 ax=float(imu_out.ax), ay=float(imu_out.ay), az=float(imu_out.az),
                 stamp=float(imu_out.stamp)
-            ))
+                ),
+                imu_out.gyro_var,
+                imu_out.acc_var
+            )
         except Exception as e:
             self.get_logger().warn(f"EKF propagate failed: {e}")
 
-        # === AirIO 속도 예측 — 디커플링: 일부 호출 스킵(정지 판정 없음) ===
-        # stationary = self._is_stationary(imu_out.stamp)
+        # === AirIO 속도 예측 ===
         t2 = time.time()
-        # run_airio = (self.proc_count % self.airio_every == 0) and (not stationary)
         run_airio = (self.proc_count % self.airio_every == 0)
         if run_airio:
             # EKF 추정 자세 사용
@@ -403,25 +403,8 @@ class AirIoImuOdomNode(Node):
             self.airio_network_step_t_deque.append(airio_network_step_t)
             self.total_t_deque.append(total_t)
 
-        # republish IMU (보정된 최신 샘플)
-        imu_msg = Imu()
-        imu_msg.header.stamp.sec = self.imu_sec
-        imu_msg.header.stamp.nanosec = self.imu_nanosec
-        imu_msg.header.frame_id = "base_link"
-        imu_msg.angular_velocity.x = float(imu_out.wx)
-        imu_msg.angular_velocity.y = float(imu_out.wy)
-        imu_msg.angular_velocity.z = float(imu_out.wz)
-        imu_msg.linear_acceleration.x = float(imu_out.ax)
-        imu_msg.linear_acceleration.y = float(imu_out.ay)
-        imu_msg.linear_acceleration.z = float(imu_out.az)
-        imu_msg.orientation.x = float(imu_out.qx)
-        imu_msg.orientation.y = float(imu_out.qy)
-        imu_msg.orientation.z = float(imu_out.qz)
-        imu_msg.orientation.w = float(imu_out.qw)
-        self.filtered_pub.publish(imu_msg)
-
         # publish odom (frame=map) — EKF 상태 직결
-        self._publish_ekf_state()
+        self._publish_ekf_state_if_due()
 
     def _now_ros_time_sec(self) -> float:
         # ROS 시뮬레이션 시간(/clock) 사용 시에도 안전하게 초 단위 반환

@@ -209,7 +209,7 @@ class AirIMUCorrector:
 
         try:
             with torch.inference_mode():
-                inf = self.model.inference(data)  # dict 예상
+                inf = self.model.inference(data)  
             # corrected = raw[:, interval:, :] + correction
             corr_acc  = inf['correction_acc']          # (1, T-interval, 3)
             corr_gyro = inf['correction_gyro']         # (1, T-interval, 3)
@@ -255,7 +255,7 @@ class AirIMUCorrector:
 
     def correct_latest(self) -> Optional[CorrectedImu]:
         """
-        integrate 없이 inference만 수행하여 보정된 IMU 한 프레임을 반환.
+        inference만 수행하여 보정된 IMU 한 프레임을 반환.
         길이/stride 미충족 시에는 캐시 또는 pass-through 반환.
         항상 gyro_var/acc_var가 채워진 CorrectedImu를 돌려준다(가능 시).
         """

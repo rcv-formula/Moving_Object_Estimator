@@ -1,6 +1,7 @@
-// scan_processor_node.cpp (MapManager/odom/message_filters 전부 제거, 로컬 프레임 전용)
+// scan_processor_node.cpp (ApproximateTime: /scan + /odom 동기화 + /processed_odom 재발행)
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -8,6 +9,7 @@
 #include <vector>
 #include <limits>
 #include <algorithm>
+#include "object_detector/msg/marker_array_stamped.hpp"
 
 // PCL
 #include <pcl/point_cloud.h>
@@ -18,11 +20,20 @@
 // Eigen (필요시 남겨둠)
 #include <Eigen/Dense>
 
+// message_filters (ApproximateTime)
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
 struct Point2D { double x, y; float i; };
 
 class ScanProcessor : public rclcpp::Node
 {
 public:
+  using Laser = sensor_msgs::msg::LaserScan;
+  using Odom  = nav_msgs::msg::Odometry;
+  using ApproxPolicy = message_filters::sync_policies::ApproximateTime<Laser, Odom>;
+
   ScanProcessor() : Node("scan_processor")
   {
     // 스캔 필터링 파라미터
@@ -65,22 +76,41 @@ public:
     this->get_parameter("sor_mean_k", sor_mean_k_);
     this->get_parameter("sor_stddev_mul", sor_stddev_mul_);
 
-    // scan만 구독
-    scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-      "/scan", rclcpp::SensorDataQoS(),
-      std::bind(&ScanProcessor::scanCallback, this, std::placeholders::_1));
-
     // 퍼블리셔
     candidate_pub_     = this->create_publisher<geometry_msgs::msg::PointStamped>("/obstacle_candidates", 20);
     filtered_scan_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("filtered_scan_points", 20);
     wall_scan_pub_     = this->create_publisher<sensor_msgs::msg::PointCloud2>("wall_points", 20);
-    marker_array_pub_  = this->create_publisher<visualization_msgs::msg::MarkerArray>("/detected_obstacles", 10);
-    sor_scan_pub_      = this->create_publisher<sensor_msgs::msg::PointCloud2>("/sor_filtered_points", 10);
+    marker_array_pub_  = this->create_publisher<object_detector::msg::MarkerArrayStamped>("/detected_obstacles", 10);
+    scan_pub_          = this->create_publisher<sensor_msgs::msg::PointCloud2>("/processed_scan", 10);
+    processed_odom_pub_= this->create_publisher<nav_msgs::msg::Odometry>("/processed_odom", 10);
+
+    // === message_filters 구독자 + ApproximateTime 동기화 ===
+    // 센서 데이터 QoS (best_effort, volatile)
+    rclcpp::SensorDataQoS sensor_qos;
+    auto rmw_qos = sensor_qos.get_rmw_qos_profile();
+
+    scan_mf_sub_.subscribe(this, "/scan", rmw_qos);
+    odom_mf_sub_.subscribe(this, "/odom", rmw_qos);
+
+    sync_ = std::make_shared<message_filters::Synchronizer<ApproxPolicy>>(ApproxPolicy(1000), scan_mf_sub_, odom_mf_sub_);
+    sync_->registerCallback(std::bind(&ScanProcessor::syncCallback, this,
+                                      std::placeholders::_1, std::placeholders::_2));
   }
 
 private:
-  void scanCallback(const sensor_msgs::msg::LaserScan::ConstSharedPtr& scan_msg)
+  // 동기화 콜백: LaserScan + Odom
+  void syncCallback(const Laser::ConstSharedPtr& scan_msg,
+                    const Odom::ConstSharedPtr& odom_msg)
   {
+    // --- /processed_odom: scan과 같은 timestamp로 발행 ---
+    {
+      nav_msgs::msg::Odometry odom_out = *odom_msg;          // 원본 내용 복사
+      odom_out.header.stamp = scan_msg->header.stamp;        // 스캔과 동일한 stamp로 맞춤
+      // odom_out.header.frame_id 는 원본 유지 (필요 시 scan_msg->header.frame_id로 바꿔도 됨)
+      processed_odom_pub_->publish(odom_out);
+    }
+    
+
     // 1) LaserScan → LiDAR 로컬 포인트
     std::vector<Point2D> local_points;
     local_points.reserve(scan_msg->ranges.size());
@@ -93,26 +123,7 @@ private:
       local_points.push_back({r * std::cos(a), r * std::sin(a), 0.0f});
     }
 
-    // 2) SOR (로컬)
-    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_in = toPointCloud(local_points);
-    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_sor(new pcl::PointCloud<pcl::PointXYZI>);
-    {
-      pcl::StatisticalOutlierRemoval<pcl::PointXYZI> sor;
-      sor.setInputCloud(cloud_in);
-      sor.setMeanK(sor_mean_k_);
-      sor.setStddevMulThresh(sor_stddev_mul_);
-      sor.setNegative(false);
-      sor.filter(*cloud_sor);
-    }
-    sensor_msgs::msg::PointCloud2 sor_msg;
-    pcl::toROSMsg(*cloud_sor, sor_msg);
-    sor_msg.header.frame_id = scan_msg->header.frame_id;
-    sor_msg.header.stamp    = scan_msg->header.stamp;
-    sor_scan_pub_->publish(sor_msg);
-
-    local_points = toPoint2D(cloud_sor);
-
-    // 센서 원점(로컬): (0,0)
+    // 센서 원점(로컬)
     constexpr double sensor_x = 0.0, sensor_y = 0.0;
 
     // 3) 벽 필터링
@@ -155,8 +166,9 @@ private:
     auto clusters = dbscanClustering(filtered_local_points, dbscan_epsilon_, min_cluster_points_);
 
     // 7) 검출 마커/후보 (로컬)
-    visualization_msgs::msg::MarkerArray marr;
+    object_detector::msg::MarkerArrayStamped marr;
     {
+      marr.header = scan_msg->header;
       visualization_msgs::msg::Marker del;
       del.header.frame_id = scan_msg->header.frame_id;
       del.header.stamp    = scan_msg->header.stamp;
@@ -165,6 +177,13 @@ private:
       del.action = visualization_msgs::msg::Marker::DELETEALL;
       marr.markers.push_back(del);
     }
+
+    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_in = toPointCloud(local_points);
+
+    sensor_msgs::msg::PointCloud2 sor_msg;
+    pcl::toROSMsg(*cloud_in, sor_msg);
+    sor_msg.header.frame_id = scan_msg->header.frame_id;
+    sor_msg.header.stamp    = scan_msg->header.stamp;
 
     int mid = 0;
     for (const auto &cluster : clusters) {
@@ -203,7 +222,9 @@ private:
       m.lifetime = rclcpp::Duration::from_seconds(0.25);
       marr.markers.push_back(m);
     }
+
     marker_array_pub_->publish(marr);
+    scan_pub_->publish(sor_msg);
   }
 
   // ====== 헬퍼 ======
@@ -358,13 +379,18 @@ private:
     return {filtered_points, wall_points};
   }
 
-  // ROS I/O
-  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  // === message_filters 구독자/동기화자 ===
+  message_filters::Subscriber<Laser> scan_mf_sub_;
+  message_filters::Subscriber<Odom>  odom_mf_sub_;
+  std::shared_ptr<message_filters::Synchronizer<ApproxPolicy>> sync_;
+
+  // 퍼블리셔
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr      candidate_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr       filtered_scan_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr         wall_scan_pub_;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr  marker_array_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr         sor_scan_pub_;
+  rclcpp::Publisher<object_detector::msg::MarkerArrayStamped>::SharedPtr  marker_array_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr         scan_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr               processed_odom_pub_;
 
   // 파라미터
   double scan_range_min_, scan_range_max_, scan_angle_min_, scan_angle_max_;

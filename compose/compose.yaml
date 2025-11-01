@@ -6,7 +6,6 @@ services:
       dockerfile: containers/Dockerfile.nogpu
     image: mos:nogpu
     container_name: mos_desktop
-    runtime: nvidia
     environment:
       - DISPLAY=${DISPLAY}
 
