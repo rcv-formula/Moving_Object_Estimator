@@ -45,7 +45,7 @@ class AirIoImuOdomNode(Node):
         self.declare_parameter("device", "cpu")
         self.declare_parameter("airimu_seqlen", 100)
         # 퍼블리시는 단순화(권장: 1), airio_every만 유지
-        self.declare_parameter("airio_every", 1)
+        self.declare_parameter("airio_every", 5)
         self.declare_parameter("timming_logging_mode", False)
         self.declare_parameter("timming_logging_outputpath", ".")
         self.declare_parameter("odom_pub_rate", 50.0)  # 추가: /odom_airio 퍼블리시 주기(Hz)
@@ -106,6 +106,8 @@ class AirIoImuOdomNode(Node):
             Imu, '/imu/data_raw', self.imu_callback,
             qos_profile_sensor_data, callback_group=self.cbgroup_imu
         )
+        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+
         self.odom_pub     = self.create_publisher(Odometry, '/odom_airio', 10)
         self.filtered_pub = self.create_publisher(Imu,      '/airimu_imu_data', 10)
         self.imu_sec = None
@@ -171,7 +173,6 @@ class AirIoImuOdomNode(Node):
                     "Continuing anyway — check 'ros2 topic echo /clock' and rosbag '--clock'."
                 )
                 break
-
     def _diff_velocity(self, prev: Odometry, curr: Odometry):
         p0, p1 = prev.pose.pose.position, curr.pose.pose.position
         t0 = prev.header.stamp.sec + prev.header.stamp.nanosec * 1e-9
@@ -181,10 +182,79 @@ class AirIoImuOdomNode(Node):
             raise ValueError(f"non-positive dt: {dt}")
         return [(p1.x - p0.x)/dt, (p1.y - p0.y)/dt, (p1.z - p0.z)/dt], t1
 
+    # def _is_stationary(self, now_stamp: float) -> bool:
+    #     if not self._imu_hist:
+    #         return False
+    #     win_start = now_stamp - self.zupt_win_sec
+    #     g_vals, a_vals = [], []
+    #     for t, g, a in self._imu_hist:
+    #         if t >= win_start:
+    #             g_vals.append(g); a_vals.append(a)
+    #     if len(g_vals) < 3:
+    #         return False
+    #     g_mean = float(np.mean(g_vals))
+    #     a_mean = float(np.mean(a_vals))
+    #     return (g_mean < self.gyro_thr) and (a_mean < self.acc_thr)
+
+    # === Callbacks ===
+    def odom_callback(self, msg: Odometry):
+        # 초기화(첫 2프레임) 로직
+        if not self.initialized:
+            with self.init_lock:
+                if self.initialized:
+                    return
+                if self.prev_odom is None:
+                    self.prev_odom = msg
+                    self.get_logger().info("First /odom buffered. Waiting next /odom for diff-velocity.")
+                    return
+                try:
+                    _, _ = self._diff_velocity(self.prev_odom, msg)
+                except Exception as e:
+                    self.prev_odom = msg
+                    self.get_logger().warn(f"diff-velocity failed; defer init. reason={e}")
+                    return
+
+                p = msg.pose.pose.position
+                q = msg.pose.pose.orientation
+                v = msg.twist.twist.linear
+                self.init_state = {
+                    "pos": [p.x, p.y, p.z],
+                    "rot": [q.x, q.y, q.z, q.w],
+                    "vel": [v.x, v.y, v.z],
+                    "stamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                }
+
+                try:
+                    if hasattr(self.airio, "set_init_state"):
+                        self.airio.set_init_state(self.init_state)
+                    if hasattr(self.corrector, "set_init_state"):
+                        self.corrector.set_init_state(self.init_state)
+                    if hasattr(self.ekf, "set_init_state"):
+                        self.ekf.set_init_state(self.init_state)
+                except Exception as e:
+                    self.get_logger().warn(f"set_init_state hook failed: {e}")
+
+                self.initialized = True
+                self.get_logger().info(f"/odom init pos={self.init_state['pos']} vel={self.init_state['vel']}")
+                return
+
+        # 초기화 이후에는 재정렬 요청
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        v = msg.twist.twist.linear
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        req = {
+            "pos": np.array([p.x, p.y, p.z], dtype=float),
+            "rot": np.array([q.x, q.y, q.z, q.w], dtype=float),
+            "vel": np.array([v.x, v.y, v.z], dtype=float),
+            "stamp": stamp
+        }
+        with self._realign_lock:
+            self._realign_req = req
+
     def imu_callback(self, msg: Imu):
-        # if not self.initialized:
-        #     return
-        
+        if not self.initialized:
+            return
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         self.imu_sec = msg.header.stamp.sec
         self.imu_nanosec = msg.header.stamp.nanosec
@@ -196,10 +266,20 @@ class AirIoImuOdomNode(Node):
             stamp=stamp
         )
 
-        self.corrector.add_sample(imu_in)
-        self.airio.add_sample(imu_in)
+        # add_sample 보호 (최소 락 구간)
+        with self.sample_lock:
+            self.corrector.add_sample(imu_in)
+            self.airio.add_sample(imu_in)
+
+        # 정지 판정용 히스토리 기록(가벼운 계산) — 비활성화
+        # gx, gy, gz = msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z
+        # ax, ay, az = msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z
+        # gyro_norm = float(np.linalg.norm([gx, gy, gz]))
+        # acc_norm  = float(np.linalg.norm([ax, ay, az]) - self.gravity)
+        # self._imu_hist.append((stamp, gyro_norm, abs(acc_norm)))
 
         # ====== seqlen 샘플마다 처리 트리거 ======
+        self.samples_since_proc += 1
         if self.samples_since_proc >= max(1, self.seqlen):
             # 재진입 방지: 바쁘면 스킵하고 다음 기회에 처리
             if self.proc_lock.acquire(False):
@@ -208,11 +288,34 @@ class AirIoImuOdomNode(Node):
                 finally:
                     self.samples_since_proc = 0
                     self.proc_lock.release()
+        else:
+            # seqlen 미만일 때는 EKF를 즉시 propagate + 바로 publish 
+            try:
+                # AIR-IMU가 준비되기 전까지는 최소 보정치로 EKF 예측
+                wx, wy, wz, axc, ayc, azc = self.corrector.fallback_correct_vals(imu_in)
+            except Exception:
+                # 혹시 보정 접근 실패하면 원시값 사용
+                wx, wy, wz, axc, ayc, azc = imu_in.wx, imu_in.wy, imu_in.wz, imu_in.ax, imu_in.ay, imu_in.az
+    
+            try:
+                self.ekf.add_imu(ImuSample(
+                    wx=float(wx), wy=float(wy), wz=float(wz),
+                    ax=float(axc), ay=float(ayc), az=float(azc),
+                    stamp=float(stamp)
+                ))
+            except Exception as e:
+                self.get_logger().warn(f"EKF propagate (light) failed: {e}")
+                return
+    
+            # AIR-IO 업데이트/보정 없이, EKF 상태를 즉시 퍼블리시
+            self._publish_ekf_state_if_due()
+
+    # === 타이머 대신 호출되는 처리 본문 ===
     
     def _process_once(self):
-        # if not self.initialized:
-        #     return
-        
+        if not self.initialized:
+            return
+
         self.proc_count += 1  # 디커플링 카운터
         t0 = time.time()
 
@@ -222,21 +325,42 @@ class AirIoImuOdomNode(Node):
             return
         airimu_step_t = time.time() - t0
 
+        # === 재정렬 요청 반영 (통합기 제거된 버전: EKF/모듈만 리셋) ===
+        with self._realign_lock:
+            req = self._realign_req
+            self._realign_req = None
+        if req is not None:
+            try:
+                self.init_state = {
+                    "pos": req["pos"].tolist(),
+                    "rot": req["rot"].tolist(),
+                    "vel": req["vel"].tolist(),
+                    "stamp": req["stamp"]
+                }
+                # EKF/모듈 초기화만 갱신
+                if hasattr(self.ekf, "set_init_state"):
+                    self.ekf.set_init_state(self.init_state)
+                if hasattr(self.airio, "set_init_state"):
+                    self.airio.set_init_state(self.init_state)
+                if hasattr(self.corrector, "set_init_state"):
+                    self.corrector.set_init_state(self.init_state)
+            except Exception as e:
+                self.get_logger().error(f"Realign failed: {e}")
+
         # === EKF PROPAGATION (보정 IMU 사용) ===
         try:
             self.ekf.add_imu(ImuSample(
                 wx=float(imu_out.wx), wy=float(imu_out.wy), wz=float(imu_out.wz),
                 ax=float(imu_out.ax), ay=float(imu_out.ay), az=float(imu_out.az),
                 stamp=float(imu_out.stamp)
-                ),
-                imu_out.gyro_var,
-                imu_out.acc_var
-            )
+            ))
         except Exception as e:
             self.get_logger().warn(f"EKF propagate failed: {e}")
 
-        # === AirIO 속도 예측 ===
+        # === AirIO 속도 예측 — 디커플링: 일부 호출 스킵(정지 판정 없음) ===
+        # stationary = self._is_stationary(imu_out.stamp)
         t2 = time.time()
+        # run_airio = (self.proc_count % self.airio_every == 0) and (not stationary)
         run_airio = (self.proc_count % self.airio_every == 0)
         if run_airio:
             # EKF 추정 자세 사용
@@ -294,23 +418,10 @@ class AirIoImuOdomNode(Node):
         imu_msg.orientation.y = float(imu_out.qy)
         imu_msg.orientation.z = float(imu_out.qz)
         imu_msg.orientation.w = float(imu_out.qw)
-        # 공분산 관련 update
-        gyro_var = imu_out.gyro_var
-        acc_var = imu_out.acc_var
-        imu_msg.linear_acceleration_covariance = [
-            float(acc_var[0]), 0.0, 0.0,
-            0.0, float(acc_var[1]), 0.0,
-            0.0, 0.0, float(acc_var[2])
-        ]
-        imu_msg.angular_velocity_covariance = [
-        float(gyro_var[0]), 0.0, 0.0,
-        0.0, float(gyro_var[1]), 0.0,
-        0.0, 0.0, float(gyro_var[2])
-        ]
         self.filtered_pub.publish(imu_msg)
-        
+
         # publish odom (frame=map) — EKF 상태 직결
-        self._publish_ekf_state_if_due()
+        self._publish_ekf_state()
 
     def _now_ros_time_sec(self) -> float:
         # ROS 시뮬레이션 시간(/clock) 사용 시에도 안전하게 초 단위 반환
