@@ -181,23 +181,9 @@ class AirIoImuOdomNode(Node):
             raise ValueError(f"non-positive dt: {dt}")
         return [(p1.x - p0.x)/dt, (p1.y - p0.y)/dt, (p1.z - p0.z)/dt], t1
 
-    # def _is_stationary(self, now_stamp: float) -> bool:
-    #     if not self._imu_hist:
-    #         return False
-    #     win_start = now_stamp - self.zupt_win_sec
-    #     g_vals, a_vals = [], []
-    #     for t, g, a in self._imu_hist:
-    #         if t >= win_start:
-    #             g_vals.append(g); a_vals.append(a)
-    #     if len(g_vals) < 3:
-    #         return False
-    #     g_mean = float(np.mean(g_vals))
-    #     a_mean = float(np.mean(a_vals))
-    #     return (g_mean < self.gyro_thr) and (a_mean < self.acc_thr)
-
     def imu_callback(self, msg: Imu):
-        if not self.initialized:
-            return
+        # if not self.initialized:
+        #     return
         
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         self.imu_sec = msg.header.stamp.sec
@@ -224,8 +210,8 @@ class AirIoImuOdomNode(Node):
                     self.proc_lock.release()
     
     def _process_once(self):
-        if not self.initialized:
-            return
+        # if not self.initialized:
+        #     return
         
         self.proc_count += 1  # 디커플링 카운터
         t0 = time.time()

@@ -213,7 +213,6 @@ class OdomFusionEkfNode(Node):
             chi2 = max(self.chi2_thresh, 30.0)
             amax = max(self.alpha_max, 100.0)
 
-        # ★ NEW: Carto가 covariance를 제공하면 그대로 사용
         if self.use_carto_cov_from_msg:
             C6 = _cov6_from_odom(m)
             if C6 is not None:
@@ -225,10 +224,9 @@ class OdomFusionEkfNode(Node):
                 p_meas=p, q_meas=q,
                 R_p=Rp, R_theta=Rth,
                 chi2_thresh=chi2, alpha_max=amax,
-                skip_thresh=self.skip_thresh   # ★ NEW: 너무 크면 스킵
+                skip_thresh=self.skip_thresh   
             )
             if lam > self.skip_thresh:
-                # 스킵 임계 초과 → 쿨다운
                 self.skip_until_sec = now + self.cooldown_sec
                 self.get_logger().warn(f"Carto pose skipped: λ={lam:.1f} (cooldown {self.cooldown_sec:.2f}s)")
             elif lam > chi2:
