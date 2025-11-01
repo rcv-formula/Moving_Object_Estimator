@@ -28,6 +28,7 @@ setup(
             'imu_result_plot = airio_imu_odometry.nodes.imu_result_plot:main',
             'ate_rte_evaluator = airio_imu_odometry.nodes.ate_rte_evaluator:main',
             'profile_airio = airio_imu_odometry.nodes.profile_airio:main',
+            'carto_airio_ekf_node = airio_imu_odometry.carto_airio_ekf_node:main'
         ],
     },
 )
