@@ -7,288 +7,477 @@ import numpy as np
 from sensor_msgs.msg import Imu
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion
-from airio_imu_odometry.ekf_wrapper import AirIOEKFWrapper, ImuSample, EkfParams
 
-# ----------------- helpers -----------------
-def _ang_deg(q_meas, q_pred):
-    # 각도차(deg)
-    from math import acos, degrees
-    import numpy as np
-    qm = np.asarray(q_meas, float); qp = np.asarray(q_pred, float)
-    dot = abs(np.dot(qm, qp))
-    dot = max(min(dot, 1.0), -1.0)
-    return degrees(2*acos(dot))
+# ==========================
+# SO(3) / Quaternion helpers
+# ==========================
+def quat_multiply(q1, q2):
+    x1,y1,z1,w1 = q1; x2,y2,z2,w2 = q2
+    return np.array([
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        w1*w2 - x1*x2 - y1*y2 - z1*z2
+    ], float)
 
-def _cov6_from_odom(msg: Odometry):
-    """Odometry.pose.covariance(36개)를 6x6으로. 0/음수/비정상은 None."""
-    C = np.array(msg.pose.covariance, dtype=float)
-    if C.size != 36:
-        return None
-    C = C.reshape(6, 6)
+def quat_normalize(q):
+    n = np.linalg.norm(q)
+    return q/n if n > 1e-12 else np.array([0,0,0,1], float)
 
-    # 대각 유효성: 너무 작거나(≈0) 음수면 무효
-    diag = np.array([C[0,0], C[1,1], C[2,2], C[3,3], C[4,4], C[5,5]], dtype=float)
-    if np.any(diag <= 1e-12):   # ★ 0 포함 차단
-        return None
+def so3_exp(phi):
+    th = np.linalg.norm(phi)
+    if th < 1e-12: return np.array([0,0,0,1], float)
+    axis = phi/th; s = np.sin(th/2.0)
+    return np.array([axis[0]*s, axis[1]*s, axis[2]*s, np.cos(th/2.0)], float)
 
-    # 수치 안정화(대칭화 + 바닥값)
-    C = 0.5*(C + C.T)
-    C += 1e-12*np.eye(6)
+def so3_log(q):
+    q = quat_normalize(q); v = q[:3]; w = q[3]
+    s = np.linalg.norm(v)
+    if s < 1e-12: return np.zeros(3, float)
+    axis = v/s; th = 2.0*np.arctan2(s, w)
+    return axis*th
+
+def rot_from_quat(q):
+    x,y,z,w = q
+    xx,yy,zz = x*x, y*y, z*z
+    xy,xz,yz = x*y, x*z, y*z
+    wx,wy,wz = w*x, w*y, w*z
+    return np.array([
+        [1-2*(yy+zz), 2*(xy-wz),   2*(xz+wy)],
+        [2*(xy+wz),   1-2*(xx+zz), 2*(yz-wx)],
+        [2*(xz-wy),   2*(yz+wx),   1-2*(xx+yy)]
+    ], float)
+
+def quat_from_msg(qm: Quaternion):
+    return np.array([qm.x, qm.y, qm.z, qm.w], float)
+
+def quat_to_msg(q):
+    m = Quaternion(); m.x,m.y,m.z,m.w = q.tolist(); return m
+
+def ang_diff_deg(q_meas, q_pred):
+    dot = abs(float(np.dot(q_meas, q_pred)))
+    dot = max(min(dot,1.0), -1.0)
+    return np.degrees(2*np.arccos(dot))
+
+# ==========================
+# Odometry covariance helper
+# ==========================
+def cov6_from_odom(msg: Odometry):
+    C = np.array(msg.pose.covariance, float)
+    if C.size != 36: return None
+    C = C.reshape(6,6)
+    if np.any(np.diag(C) <= 1e-12): return None
+    C = 0.5*(C + C.T) + 1e-12*np.eye(6)
     return C
 
-def _diag3_from_cov(cov_list):
-    # cov_list: 9개 원소의 row-major 3x3
-    if cov_list is None or len(cov_list) != 9:
-        return None
-    d0, d1, d2 = float(cov_list[0]), float(cov_list[4]), float(cov_list[8])
-    # ROS 규약: -1 은 unknown
-    if d0 < 0.0 or d1 < 0.0 or d2 < 0.0:
-        return None
-    return (d0, d1, d2)
+# ==========================
+# Simple 9-state error EKF
+# x = [δp, δv, δθ], nominal = {p, v, q}
+# ==========================
+class SimpleImuPoseEKF:
+    def __init__(self, gyro_noise=0.02, acc_noise=0.20, g=9.80665):
+        self.p = np.zeros(3); self.v = np.zeros(3); self.q = np.array([0,0,0,1], float)
+        self.P = np.eye(9)*1e-2
+        self.qp  = 1e-3
+        self.qv  = float(acc_noise**2)
+        self.qth = float(gyro_noise**2)
+        self.g = np.array([0,0,-g], float)
+        self.last_t = None
 
-def quat_to_np(q: Quaternion):
-    return np.array([q.x, q.y, q.z, q.w], dtype=float)
+    def predict(self, imu: Imu, t: float, q_scale=1.0, imu_has_gravity=True):
+        if self.last_t is None:
+            self.last_t = t; return
+        dt = max(1e-4, min(0.05, t - self.last_t))
+        self.last_t = t
 
-def rot_from_quat(q: np.ndarray):
-    x, y, z, w = q
-    xx, yy, zz = x*x, y*y, z*z
-    xy, xz, yz = x*y, x*z, y*z
-    wx, wy, wz = w*x, w*y, w*z
-    return np.array([
-        [1 - 2*(yy+zz), 2*(xy - wz),     2*(xz + wy)],
-        [2*(xy + wz),   1 - 2*(xx+zz),   2*(yz - wx)],
-        [2*(xz - wy),   2*(yz + wx),     1 - 2*(xx+yy)]
-    ], dtype=float)
+        wm = np.array([imu.angular_velocity.x, imu.angular_velocity.y, imu.angular_velocity.z], float)
+        dq = so3_exp(wm*dt)
+        self.q = quat_normalize(quat_multiply(self.q, dq))
+        R = rot_from_quat(self.q)
 
-def _cov6_from_odom(msg: Odometry):
-    """Odometry.pose.covariance(36개)를 6x6으로 반환. 실패 시 None."""
-    C = np.array(msg.pose.covariance, dtype=float)
-    if C.shape[0] != 36:
-        return None
-    C = C.reshape(6, 6)
-    # 유효성 검사(대각 -1이면 unknown으로 보는 경우가 있음)
-    d = np.array([C[0,0], C[1,1], C[2,2], C[3,3], C[4,4], C[5,5]])
-    if np.any(d < 0.0):
-        return None
-    # 수치 안정화
-    return C + 1e-12*np.eye(6)
+        am = np.array([imu.linear_acceleration.x, imu.linear_acceleration.y, imu.linear_acceleration.z], float)
+        if imu_has_gravity:
+            a_w = R @ am + self.g   # raw IMU(-g 포함)
+        else:
+            a_w = R @ am            # 이미 중력 보정된 IMU
 
-# ----------------- node -----------------
-class OdomFusionEkfNode(Node):
+        v_old = self.v.copy()
+        self.p = self.p + v_old*dt + 0.5*a_w*(dt**2)
+        self.v = v_old + a_w*dt
+
+        I3 = np.eye(3)
+        Phi = np.block([[I3, dt*I3, np.zeros((3,3))],
+                        [np.zeros((3,3)), I3, np.zeros((3,3))],
+                        [np.zeros((3,3)), np.zeros((3,3)), I3]])
+        Q = np.block([
+            [self.qp*np.eye(3)*dt, np.zeros((3,3)), np.zeros((3,3))],
+            [np.zeros((3,3)), self.qv*np.eye(3)*dt, np.zeros((3,3))],
+            [np.zeros((3,3)), np.zeros((3,3)), self.qth*np.eye(3)*dt]
+        ]) * float(q_scale)
+        self.P = Phi @ self.P @ Phi.T + Q
+
+    def update_pose(self, p_meas, q_meas, Rp, Rth, H_mask=None,
+                    chi2_thresh=30.0, alpha_max=100.0, skip_thresh=-1.0):
+        p_meas = np.asarray(p_meas, float)
+        q_meas = quat_normalize(np.asarray(q_meas, float))
+
+        dp = p_meas - self.p
+        q_err = quat_multiply(q_meas, np.array([-self.q[0], -self.q[1], -self.q[2], self.q[3]]))
+        dth = so3_log(q_err)
+
+        z = np.hstack([dp, dth])
+        H = np.block([[np.eye(3), np.zeros((3,3)), np.zeros((3,3))],
+                      [np.zeros((3,3)), np.zeros((3,3)), np.eye(3)]])  # 6x9
+        Rm = np.block([[Rp, np.zeros((3,3))],
+                       [np.zeros((3,3)), Rth]])
+
+        if H_mask is not None:
+            mask = np.array(H_mask, bool)
+            H = H[mask]; z = z[mask]; Rm = Rm[np.ix_(mask, mask)]
+
+        S = H @ self.P @ H.T + Rm
+        S = 0.5*(S + S.T) + 1e-9*np.eye(S.shape[0])
+        S_inv = np.linalg.inv(S)
+
+        lam = float(z.T @ S_inv @ z) if z.size > 0 else 0.0
+        if skip_thresh > 0 and lam > skip_thresh:
+            return lam
+
+        if lam > chi2_thresh and z.size > 0:
+            infl = min(alpha_max, max(1.0, lam/chi2_thresh))
+            Rm = Rm * infl
+            S = H @ self.P @ H.T + Rm
+            S = 0.5*(S + S.T) + 1e-9*np.eye(S.shape[0])
+            S_inv = np.linalg.inv(S)
+
+        if z.size > 0:
+            K = self.P @ H.T @ S_inv
+            dx = K @ z
+            self.P = (np.eye(9) - K @ H) @ self.P
+            self.p += dx[0:3]
+            self.v += dx[3:6]
+            self.q = quat_normalize(quat_multiply(self.q, so3_exp(dx[6:9])))
+
+        return lam
+
+    def update_velocity_body(self, v_b, Rv_b):
+        """Body-frame 속도 업데이트 (AirIO)"""
+        v_b = np.asarray(v_b, float).reshape(3)
+        Rv_b = np.asarray(Rv_b, float).reshape(3,3)
+        # 측정 모델: z = v_b_meas - R^T v_world  ≈ H dx
+        Rwb = rot_from_quat(self.q)
+        z = v_b - (Rwb.T @ self.v)
+
+        H = np.zeros((3,9), float)
+        H[:,3:6] = -Rwb.T     # δv_world
+        # δθ 항(선형화)도 넣을 수 있으나 안정성을 위해 생략/작게
+        S = H @ self.P @ H.T + Rv_b
+        S = 0.5*(S + S.T) + 1e-9*np.eye(3)
+        K = self.P @ H.T @ np.linalg.inv(S)
+        dx = K @ z
+        self.P = (np.eye(9) - K @ H) @ self.P
+        self.p += dx[0:3]
+        self.v += dx[3:6]
+        self.q = quat_normalize(quat_multiply(self.q, so3_exp(dx[6:9])))
+
+    def hard_snap_to_measurement(self, p_meas, q_meas, vel_damping=0.5):
+        self.p = np.asarray(p_meas, float)
+        self.q = quat_normalize(np.asarray(q_meas, float))
+        self.v *= float(vel_damping)
+        self.P = self.P + np.diag([0.1,0.1,0.1, 0.1,0.1,0.1, np.deg2rad(5)**2]*3)[:9,:9]
+
+    def soft_blend_toward_measurement(self, p_meas, q_meas, beta=0.6):
+        p_meas = np.asarray(p_meas, float)
+        q_meas = quat_normalize(np.asarray(q_meas, float))
+        self.p = (1.0-beta)*self.p + beta*p_meas
+        q_err = quat_multiply(q_meas, np.array([-self.q[0], -self.q[1], -self.q[2], self.q[3]]))
+        self.q = quat_normalize(quat_multiply(self.q, so3_exp(beta*so3_log(q_err))))
+
+    def get_state(self):
+        return {"pos": self.p.copy(), "vel": self.v.copy(), "rot": self.q.copy()}
+
+# ==========================
+# ROS2 Node (AirIMU + AirIO + Carto)
+# ==========================
+class AirioAirimuEKFNode(Node):
     """
-    /airimu_imu_data  : 보정된 IMU (predict)
-    /odom_airio       : AirIO 오도메트리(속도 + 불확실도) (update - velocity)
-    /odom             : Cartographer 오도메트리(pose)   (update - pose, 게이팅/인플레이트)
-    출력: /odom_fused
+    Predict:  /airimu_imu_data (fallback: /imu)
+    Update v: /odom_airio (Body velocity)
+    Update p: /odom (Cartographer pose)
+    Output :  /odom_fused
     """
     def __init__(self):
-        super().__init__('odom_fusion_ekf')
+        super().__init__('airio_airimu_ekf')
 
-        # ---- params ----
+        # --- Topics / Rate ---
+        self.declare_parameter("imu_topic", "/imu")
+        self.declare_parameter("airimu_topic", "/airimu_imu_data")
+        self.declare_parameter("odom_carto_topic", "/odom")
+        self.declare_parameter("odom_airio_topic", "/odom_airio")
+        self.declare_parameter("odom_pub_topic", "/odom_fused")
         self.declare_parameter("odom_pub_rate", 50.0)
-        self.declare_parameter("carto_Rp_diag", [0.05, 0.05, 0.1])           # m^2
-        self.declare_parameter("carto_Rth_diag", [(np.deg2rad(1))**2]*3)     # rad^2
-        self.declare_parameter("chi2_thresh", 22.46)     # dof=6, 0.999
-        self.declare_parameter("alpha_max", 50.0)
+
+        # --- Gravity handling ---
+        self.declare_parameter("imu_has_gravity", False)   # 보정된 IMU라면 False 권장
+
+        # --- MD mode when IMU timeout ---
+        self.declare_parameter("imu_timeout_sec", 0.25)
+        self.declare_parameter("md_q_scale", 150.0)
+
+        # --- Measurement noise fallback (std) ---
+        self.declare_parameter("default_pos_std_m", [0.15, 0.15, 0.50])
+        self.declare_parameter("default_rpy_std_deg", [1.5, 1.5, 1.5])
+        self.declare_parameter("use_carto_cov_from_msg", False)  # Carto 신뢰 ↑를 위해 기본 False
+
+        # --- Gating / Warmup / Skips ---
+        self.declare_parameter("chi2_thresh", 50.0)
+        self.declare_parameter("alpha_max", 150.0)
+        self.declare_parameter("skip_thresh", -1.0)
+        self.declare_parameter("warmup_sec", 0.5)
+        self.declare_parameter("boot_skip", 0)
+        self.declare_parameter("cooldown_sec", 0.0)
+
+        # --- 2D mode ---
+        self.declare_parameter("use_2d_mode", True)
+
+        # --- Process noises ---
+        self.declare_parameter("gyro_noise", 0.04)
+        self.declare_parameter("acc_noise", 0.35)
+
+        # --- Velocity update (AirIO) ---
         self.declare_parameter("use_body_vel_update", True)
+        self.declare_parameter("vel_deadband_mmps", 5.0)   # 5 mm/s 이하면 0
+        self.declare_parameter("vel_std_body_mps", [0.15, 0.15, 0.30])  # AirIO 속도 표준편차(Body)
 
-        # ★ NEW: 초기 정렬/웜업/스킵 관련
-        self.declare_parameter("warmup_sec", 1.0)        # 웜업 동안 R 인플레이트/임계 완화
-        self.declare_parameter("carto_boot_skip", 2)     # Carto 초기 N프레임 업데이트 스킵
-        self.declare_parameter("skip_thresh", 80.0)      # 이 값 넘으면 pose 업데이트 스킵
-        self.declare_parameter("cooldown_sec", 0.2)      # 스킵 후 쿨다운
-        self.declare_parameter("use_carto_cov_from_msg", True)  # Odometry covariance 사용
+        # --- Reset thresholds ---
+        self.declare_parameter("pos_reset_thresh_m", 1.2)
+        self.declare_parameter("yaw_reset_thresh_deg", 25.0)
+        self.declare_parameter("nis_reset_thresh", 400.0)
+        self.declare_parameter("snap_beta", 0.5)
+        self.declare_parameter("vel_damping_on_reset", 0.7)
 
+        # --- Read params ---
+        self.imu_topic = self.get_parameter("imu_topic").value
+        self.airimu_topic = self.get_parameter("airimu_topic").value
+        self.odom_carto_topic = self.get_parameter("odom_carto_topic").value
+        self.odom_airio_topic = self.get_parameter("odom_airio_topic").value
+        self.odom_pub_topic = self.get_parameter("odom_pub_topic").value
         self.pub_rate = float(self.get_parameter("odom_pub_rate").value)
         self.dt_pub = 1.0/max(1e-6, self.pub_rate)
-        self.last_pub_sec = 0.0
 
-        Rp_diag = np.array(self.get_parameter("carto_Rp_diag").value, dtype=float)
-        Rth_diag= np.array(self.get_parameter("carto_Rth_diag").value, dtype=float)
-        self.Rp = np.diag(Rp_diag)
-        self.Rth= np.diag(Rth_diag)
+        self.imu_has_gravity = bool(self.get_parameter("imu_has_gravity").value)
+        self.imu_timeout_sec = float(self.get_parameter("imu_timeout_sec").value)
+        self.md_q_scale = float(self.get_parameter("md_q_scale").value)
+
+        pos_std = np.asarray(self.get_parameter("default_pos_std_m").value, float)
+        rpy_std_deg = np.asarray(self.get_parameter("default_rpy_std_deg").value, float)
+        self.Rp_default = np.diag(pos_std**2)
+        self.Rth_default = np.diag(np.deg2rad(rpy_std_deg)**2)
+        self.use_carto_cov = bool(self.get_parameter("use_carto_cov_from_msg").value)
+
         self.chi2_thresh = float(self.get_parameter("chi2_thresh").value)
-        self.alpha_max   = float(self.get_parameter("alpha_max").value)
-        self.use_body_vel_update = bool(self.get_parameter("use_body_vel_update").value)
-
-        # ★ NEW: 초기/웜업/스킵 변수
-        self.warmup_sec   = float(self.get_parameter("warmup_sec").value)
-        self.carto_boot_skip = int(self.get_parameter("carto_boot_skip").value)
-        self.skip_thresh  = float(self.get_parameter("skip_thresh").value)
+        self.alpha_max = float(self.get_parameter("alpha_max").value)
+        self.skip_thresh = float(self.get_parameter("skip_thresh").value)
+        self.warmup_sec = float(self.get_parameter("warmup_sec").value)
+        self.boot_skip = int(self.get_parameter("boot_skip").value)
         self.cooldown_sec = float(self.get_parameter("cooldown_sec").value)
-        self.use_carto_cov_from_msg = bool(self.get_parameter("use_carto_cov_from_msg").value)
 
-        # ---- EKF ----
-        self.ekf = AirIOEKFWrapper(airio_root="", use_repo=False,
-                                   params=EkfParams(gyro_noise=0.02, acc_noise=0.20))
-        self.initialized = False            # ★ IMU에서 초기화하지 않고 Carto로 초기화할 것
-        self.start_sec   = None             # ★ 시작 시각(웜업 계산용)
+        self.use_2d_mode = bool(self.get_parameter("use_2d_mode").value)
+        gyro_n = float(self.get_parameter("gyro_noise").value)
+        acc_n  = float(self.get_parameter("acc_noise").value)
 
-        # ---- subs/pubs ----
-        self.sub_imu  = self.create_subscription(Imu,      "/airimu_imu_data", self.cb_imu,  10)
-        self.sub_air  = self.create_subscription(Odometry, "/odom_airio",      self.cb_airio, 10)
-        self.sub_carto= self.create_subscription(Odometry, "/odom",            self.cb_carto, 10)
-        self.pub_odom = self.create_publisher(Odometry,    "/odom_fused",      10)
+        self.use_body_vel_update = bool(self.get_parameter("use_body_vel_update").value)
+        self.vel_deadband_mmps = float(self.get_parameter("vel_deadband_mmps").value)
+        vel_std_body = np.asarray(self.get_parameter("vel_std_body_mps").value, float)
+        self.Rv_body = np.diag(vel_std_body**2)
 
-        # caches
-        self.last_eta_v = np.array([0.05,0.05,0.05], float)  # AirIO 속도 불확실도 기본
-        self.deadband_ms = 5.0
+        self.pos_reset_thresh_m = float(self.get_parameter("pos_reset_thresh_m").value)
+        self.yaw_reset_thresh_deg = float(self.get_parameter("yaw_reset_thresh_deg").value)
+        self.nis_reset_thresh = float(self.get_parameter("nis_reset_thresh").value)
+        self.snap_beta = float(self.get_parameter("snap_beta").value)
+        self.vel_damping_on_reset = float(self.get_parameter("vel_damping_on_reset").value)
 
-        # ★ NEW: Carto 초기 프레임 스킵/쿨다운 상태
+        # --- Filter / State ---
+        self.ekf = SimpleImuPoseEKF(gyro_noise=gyro_n, acc_noise=acc_n)
+        self.initialized = False
+        self.start_sec = self.get_clock().now().nanoseconds*1e-9
+        self.last_pub_sec = 0.0
+        self.last_imu_sec = None
+        self.last_carto_sec = 0.0
+        self.measurement_dominant = False
         self.carto_seen = 0
         self.skip_until_sec = 0.0
 
-    # ---------- callbacks ----------
+        # --- ROS I/O ---
+        # AirIMU 보정된 IMU가 우선. 없으면 raw /imu로 predict
+        self.sub_airimu = self.create_subscription(Imu, self.airimu_topic, self.cb_imu, 10)
+        self.sub_carto  = self.create_subscription(Odometry, self.odom_carto_topic, self.cb_odom_carto, 10)
+        self.sub_airio  = self.create_subscription(Odometry, self.odom_airio_topic, self.cb_odom_airio, 10)
+        self.pub_odom   = self.create_publisher(Odometry, self.odom_pub_topic, 10)
+
+        # Dummy predict 타이머(100Hz)
+        self.timer = self.create_timer(1.0/100.0, self.timer_predict)
+
+        self.get_logger().info(f"[AirioAirimuEKF] airimu={self.airimu_topic} imu={self.imu_topic} carto={self.odom_carto_topic} airio={self.odom_airio_topic} out={self.odom_pub_topic} | imu_has_gravity={self.imu_has_gravity}")
+
+    # ---------- IMU predict ----------
     def cb_imu(self, m: Imu):
-        stamp = m.header.stamp.sec + m.header.stamp.nanosec*1e-9
-
-        # ★ NEW: 시작 시각 기록(웜업 기준)
-        if self.start_sec is None:
-            self.start_sec = stamp
-
-        # ★ 변경: IMU에서 초기화하지 않음. Carto에서 초기화.
-        if not self.initialized:
-            # Carto 들어오기 전까지는 predict만 누적(단, 내부 last_t가 None이면 _propagate가 건너뛴다)
-            # 원하면 여기서 아주 느슨한 초기 상태를 줄 수도 있음.
-            pass
-
+        t = m.header.stamp.sec + m.header.stamp.nanosec*1e-9
+        # AirIMU와 raw IMU 모두 이 콜백 공유: 마지막 수신 갱신
+        self.last_imu_sec = t
+        self.measurement_dominant = False
         try:
-            gyro_var = _diag3_from_cov(m.angular_velocity_covariance)
-            acc_var  = _diag3_from_cov(m.linear_acceleration_covariance)
+            self.ekf.predict(m, t, q_scale=1.0, imu_has_gravity=self.imu_has_gravity)
+            if self.use_2d_mode:
+                # z 위치/속도 고정
+                self.ekf.p[2] = 0.0
+                self.ekf.v[2] = 0.0
+                # yaw-only quaternion으로 투영
+                R = rot_from_quat(self.ekf.q)
+                yaw = float(np.arctan2(R[1,0], R[0,0]))
+                half = 0.5*yaw
+                self.ekf.q = np.array([0.0, 0.0, np.sin(half), np.cos(half)], dtype=float)
 
-            self.ekf.add_imu(
-                ImuSample(
-                    wx=float(m.angular_velocity.x),
-                    wy=float(m.angular_velocity.y),
-                    wz=float(m.angular_velocity.z),
-                    ax=float(m.linear_acceleration.x),
-                    ay=float(m.linear_acceleration.y),
-                    az=float(m.linear_acceleration.z),
-                    stamp=float(stamp)
-                ),
-                gyro_var=gyro_var,
-                acc_var=acc_var,
-            )
         except Exception as e:
-            self.get_logger().warn(f"EKF predict failed: {e}")
+            self.get_logger().warn(f"predict failed: {e}")
+        self._publish_if_due()
+
+    # ---------- Dummy predict (IMU timeout) ----------
+    def timer_predict(self):
+        now = self.get_clock().now().nanoseconds*1e-9
+        imu_lost = (self.last_imu_sec is None) or ((now - self.last_imu_sec) > self.imu_timeout_sec)
+        carto_lost = (not self.initialized) or ((now - self.last_carto_sec) > 0.5)
+
+        if imu_lost and carto_lost:
+            # 둘 다 끊겼으면 정지 상태 유지(필요 시 속도 감쇠/0 클램프)
+            self.ekf.v[:] = 0.0
             return
 
-        self._EKF_publisher()
+        if imu_lost:
+            self.measurement_dominant = True
+            dummy = Imu()
+            try:
+                self.ekf.predict(dummy, now, q_scale=self.md_q_scale, imu_has_gravity=self.imu_has_gravity)
+                if self.use_2d_mode:
+                    self.ekf.p[2] = 0.0
+                    self.ekf.v[2] = 0.0
+                    R = rot_from_quat(self.ekf.q)
+                    yaw = float(np.arctan2(R[1,0], R[0,0]))
+                    half = 0.5*yaw
+                    self.ekf.q = np.array([0.0, 0.0, np.sin(half), np.cos(half)], dtype=float)
 
-    def cb_airio(self, m: Odometry):
+            except Exception as e:
+                self.get_logger().warn(f"dummy predict failed: {e}")
+            self._publish_if_due()
+
+    # ---------- AirIO velocity update ----------
+    def cb_odom_airio(self, m: Odometry):
+        if not self.use_body_vel_update or not self.initialized:
+            return
         try:
-            v_w = np.array([m.twist.twist.linear.x,
+            v_b = np.array([m.twist.twist.linear.x,
                             m.twist.twist.linear.y,
-                            m.twist.twist.linear.z], dtype=float)
+                            m.twist.twist.linear.z], float)
 
-            if self.use_body_vel_update and self.initialized:
-                q = self.ekf.get_state()["rot"]
-                Rwb = rot_from_quat(np.asarray(q, float))
-                v_b = Rwb.T @ v_w
+            if np.linalg.norm(v_b) * 1000.0 < self.vel_deadband_mmps:
+                v_b[:] = 0.0
 
-                if np.linalg.norm(v_b)*1000.0 < self.deadband_ms:
-                    v_b[:] = 0.0
-                Rm = np.diag(self.last_eta_v**2)  # 필요시 토픽으로 받아 반영
-                self.ekf.update_velocity_body(tuple(v_b.tolist()), Rm)
+            self.ekf.update_velocity_body(v_b, self.Rv_body)
         except Exception as e:
             self.get_logger().warn(f"AirIO velocity update failed: {e}")
-            return
-        self._EKF_publisher()
+        self._publish_if_due()
 
-    def cb_carto(self, m: Odometry):
-        t = m.header.stamp.sec + m.header.stamp.nanosec*1e-9
+    # ---------- Cartographer pose update ----------
+    def cb_odom_carto(self, m: Odometry):
+        t_now = self.get_clock().now().nanoseconds*1e-9
+        self.last_carto_sec = t_now
+
         p = np.array([m.pose.pose.position.x,
                       m.pose.pose.position.y,
-                      m.pose.pose.position.z], dtype=float)
-        q = quat_to_np(m.pose.pose.orientation)
+                      m.pose.pose.position.z], float)
+        q = quat_from_msg(m.pose.pose.orientation)
 
-        # --- 초기화 ---
         if not self.initialized:
-            self.ekf.set_init_state({"pos": p.tolist(),
-                                     "vel": [0.0, 0.0, 0.0],
-                                     "rot": q.tolist(),
-                                     "stamp": t})
-            # 초기 P 약간 키움
-            self.ekf.P[0:3,0:3] *= 10.0
-            self.ekf.P[6:9,6:9] *= 10.0
+            t0 = m.header.stamp.sec + m.header.stamp.nanosec*1e-9
+            self.ekf.p = p.copy()
+            self.ekf.v = np.zeros(3, float)
+            self.ekf.q = quat_normalize(q.copy())
+            self.ekf.P = np.eye(9)*1e-2
+            self.ekf.last_t = t0
             self.initialized = True
             self.carto_seen = 0
-            self.get_logger().info("EKF initialized from first Carto pose")
+            self.get_logger().info("EKF initialized from Cartographer /odom.")
             return
 
-        # --- 초기 N프레임 스킵 ---
+        # 부트 스킵/쿨다운
         self.carto_seen += 1
-        if self.carto_seen <= self.carto_boot_skip:
+        if self.carto_seen <= self.boot_skip:
+            return
+        if t_now < self.skip_until_sec:
             return
 
-        # --- 쿨다운 체크 ---
-        now = self.get_clock().now().nanoseconds*1e-9
-        if now < self.skip_until_sec:
-            return
+        # 기본 R
+        Rp  = self.Rp_default.copy()
+        Rth = self.Rth_default.copy()
 
-        # --- 기본 R 세팅 ---
-        Rp  = self.Rp.copy()
-        Rth = self.Rth.copy()
+        # 웜업 인플레이트
+        elapsed = t_now - self.start_sec
         chi2 = self.chi2_thresh
         amax = self.alpha_max
-
-        # 웜업 동안 인플레이트
-        elapsed = (now - self.start_sec) if (self.start_sec is not None) else 999.0
         if elapsed < self.warmup_sec:
-            Rp  *= 5.0
-            Rth *= 5.0
-            chi2 = max(chi2, 40.0)
-            amax = max(amax, 100.0)
+            Rp *= 5.0; Rth *= 5.0
+            chi2 = max(chi2, 50.0); amax = max(amax, 200.0)
 
-        # --- 메시지 공분산 사용: 0이면 무시 ---
-        if self.use_carto_cov_from_msg:
-            C6 = _cov6_from_odom(m)  # ★ 위에서 강화한 함수
+        # Carto 공분산
+        if self.use_carto_cov:
+            C6 = cov6_from_odom(m)
             if C6 is None:
-                
-                # 모두 0이거나 비정상 → 디폴트 사용
-                self.get_logger().warn("Carto covariance invalid/zero → using default Rp/Rθ")
+                # Carto를 더 신뢰: 공격적 R로 강제
+                Rp  = np.diag([0.15**2, 0.15**2, 0.50**2])
+                Rth = np.diag(np.deg2rad([1.5,1.5,1.5])**2)
+                self.get_logger().warn("Carto covariance invalid/zero → using aggressive Rp/Rθ")
             else:
-                Rp  = C6[:3,:3]
-                Rth = C6[3:,3:]
-                
-        Rp  = np.diag([0.05, 0.05, 0.10])               # m²
-        Rth = np.diag([np.deg2rad(1)**2]*3)             # rad²
+                Rp = C6[:3,:3]; Rth = C6[3:,3:]
+
+        # 2D 마스크
+        H_mask = [True, True, False,  False, False, True] if self.use_2d_mode else None
+
+        # 업데이트
         try:
-            lam = self.ekf.update_pose_world_adaptive(
+            lam = self.ekf.update_pose(
                 p_meas=p, q_meas=q,
-                R_p=Rp, R_theta=Rth,
+                Rp=Rp, Rth=Rth,
+                H_mask=H_mask,
                 chi2_thresh=chi2, alpha_max=amax,
                 skip_thresh=self.skip_thresh
             )
-            # lam 계산 직후:
-            s = self.ekf.get_state()
-            pos_pred = np.array(s["pos"])
-            rot_pred = np.array(s["rot"])
-            rp = np.linalg.norm(p - pos_pred)
-            rth_deg = _ang_deg(q, rot_pred)
-
-            self.get_logger().info(
-                f"NIS λ={lam:.2f} | rp={rp:.3f} m, rθ={rth_deg:.2f} deg | "
-                f"Rp_diag={np.diag(Rp)} Rθ_diag={np.diag(Rth)} | "
-            )
-
-            if lam > self.skip_thresh:
-                self.skip_until_sec = now + self.cooldown_sec
-                self.get_logger().warn(
-                    f"Carto pose skipped: λ={lam:.1f} (cooldown {self.cooldown_sec:.2f}s)"
-                )
-            elif lam > chi2:
-                self.get_logger().warn(f"Carto pose gated/inflated. Mahalanobis={lam:.2f}")
         except Exception as e:
-            self.get_logger().warn(f"Carto pose update failed: {e}")
+            self.get_logger().warn(f"pose update failed: {e}")
             return
 
-        self._EKF_publisher()
+        # 리셋 로직
+        s = self.ekf.get_state()
+        rp = float(np.linalg.norm((p - s["pos"])[0:2])) if self.use_2d_mode else float(np.linalg.norm(p - s["pos"]))
+        rth = ang_diff_deg(q, s["rot"])
 
+        if lam is not None and lam > self.nis_reset_thresh:
+            self.ekf.hard_snap_to_measurement(p, q, vel_damping=self.vel_damping_on_reset)
+            self.skip_until_sec = t_now + self.cooldown_sec
+            self.get_logger().warn(f"[HARD RESET] λ={lam:.1f} → snap (cooldown {self.cooldown_sec:.2f}s)")
+        elif (rp > self.pos_reset_thresh_m) or (rth > self.yaw_reset_thresh_deg):
+            self.ekf.soft_blend_toward_measurement(p, q, beta=self.snap_beta)
+            self.get_logger().warn(f"[SOFT RESET] rp={rp:.2f}m rθ={rth:.1f}° → β={self.snap_beta:.2f}")
 
-    # ---------- publish ----------
-    def _EKF_publisher(self):
-        now = self.get_clock().now().nanoseconds * 1e-9
+        # 로깅
+        mode = "MD" if self.measurement_dominant else "N"
+        lam_txt = f"{lam:.2f}" if lam is not None else "nan"
+        self.get_logger().info(f"upd[{mode}] λ={lam_txt} | rp={rp:.3f} m, rθ={rth:.2f}°")
+
+        self._publish_if_due()
+
+    # ---------- Publish ----------
+    def _publish_if_due(self):
+        now = self.get_clock().now().nanoseconds*1e-9
         if (now - self.last_pub_sec) < self.dt_pub:
             return
         self.last_pub_sec = now
@@ -299,13 +488,14 @@ class OdomFusionEkfNode(Node):
         odom.header.frame_id = "map"
         odom.child_frame_id  = "base_link"
         odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z = s["pos"].tolist()
-        odom.pose.pose.orientation.x, odom.pose.pose.orientation.y, odom.pose.pose.orientation.z, odom.pose.pose.orientation.w = s["rot"].tolist()
+        odom.pose.pose.orientation = quat_to_msg(s["rot"])
         odom.twist.twist.linear.x, odom.twist.twist.linear.y, odom.twist.twist.linear.z = s["vel"].tolist()
         self.pub_odom.publish(odom)
 
+# ==========================
 def main(args=None):
     rclpy.init(args=args)
-    node = OdomFusionEkfNode()
+    node = AirioAirimuEKFNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

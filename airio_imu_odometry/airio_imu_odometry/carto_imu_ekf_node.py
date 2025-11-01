@@ -240,8 +240,8 @@ class CartoIMUEKFNode(Node):
         self.declare_parameter("md_q_scale", 50.0)
 
         # --- Measurement noise fallback (std) ---
-        self.declare_parameter("default_pos_std_m", [0.15, 0.15, 0.50])
-        self.declare_parameter("default_rpy_std_deg", [1.5, 1.5, 1.5])
+        self.declare_parameter("default_pos_std_m", [0.05, 0.05, 0.50])
+        self.declare_parameter("default_rpy_std_deg", [0.5, 0.5, 0.5])
         self.declare_parameter("use_carto_cov_from_msg", True)
 
         # --- Gating / Warmup / Skips ---
