@@ -10,6 +10,15 @@ from geometry_msgs.msg import Quaternion
 from airio_imu_odometry.ekf_wrapper import AirIOEKFWrapper, ImuSample, EkfParams
 
 # ----------------- helpers -----------------
+def _ang_deg(q_meas, q_pred):
+    # 각도차(deg)
+    from math import acos, degrees
+    import numpy as np
+    qm = np.asarray(q_meas, float); qp = np.asarray(q_pred, float)
+    dot = abs(np.dot(qm, qp))
+    dot = max(min(dot, 1.0), -1.0)
+    return degrees(2*acos(dot))
+
 def _cov6_from_odom(msg: Odometry):
     """Odometry.pose.covariance(36개)를 6x6으로. 0/음수/비정상은 None."""
     C = np.array(msg.pose.covariance, dtype=float)
@@ -248,6 +257,18 @@ class OdomFusionEkfNode(Node):
                 chi2_thresh=chi2, alpha_max=amax,
                 skip_thresh=self.skip_thresh
             )
+            # lam 계산 직후:
+            s = self.ekf.get_state()
+            pos_pred = np.array(s["pos"])
+            rot_pred = np.array(s["rot"])
+            rp = np.linalg.norm(p - pos_pred)
+            rth_deg = _ang_deg(q, rot_pred)
+
+            self.get_logger().info(
+                f"NIS λ={lam:.2f} | rp={rp:.3f} m, rθ={rth_deg:.2f} deg | "
+                f"Rp_diag={np.diag(Rp)} Rθ_diag={np.diag(Rth)} | "
+            )
+
             if lam > self.skip_thresh:
                 self.skip_until_sec = now + self.cooldown_sec
                 self.get_logger().warn(
