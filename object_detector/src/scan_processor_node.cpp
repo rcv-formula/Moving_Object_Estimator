@@ -92,7 +92,7 @@ public:
     scan_mf_sub_.subscribe(this, "/scan", rmw_qos);
     odom_mf_sub_.subscribe(this, "/odom", rmw_qos);
 
-    sync_ = std::make_shared<message_filters::Synchronizer<ApproxPolicy>>(ApproxPolicy(1000), scan_mf_sub_, odom_mf_sub_);
+    sync_ = std::make_shared<message_filters::Synchronizer<ApproxPolicy>>(ApproxPolicy(50), scan_mf_sub_, odom_mf_sub_);
     sync_->registerCallback(std::bind(&ScanProcessor::syncCallback, this,
                                       std::placeholders::_1, std::placeholders::_2));
   }
@@ -120,7 +120,13 @@ private:
       if (r < scan_range_min_ || r > scan_range_max_ ||
           a < scan_angle_min_ || a > scan_angle_max_ ||
           !std::isfinite(r)) continue;
-      local_points.push_back({r * std::cos(a), r * std::sin(a), 0.0f});
+      
+      double px = r * std::cos(a);
+      double py = r * std::sin(a);
+      
+      if(px < 0.0) continue;
+      
+      local_points.push_back({px, py, 0.0f});
     }
 
     // 센서 원점(로컬)
