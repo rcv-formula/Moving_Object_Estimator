@@ -47,6 +47,7 @@ using object_detector::msg::MarkerArrayStamped;
 #include "map_manager_pair.hpp"
 #include "dynamic_obstacle_detector.hpp"
 #include "icp_point_to_point.hpp"
+#include "wall_map/wall.hpp"
 
 // ===== SE(3) 평균 유틸: 파일 전역(클래스 밖) =====
 namespace se3_avg {
@@ -133,6 +134,13 @@ public:
     this->declare_parameter<bool>("track_csv_has_header", true);
     this->declare_parameter<bool>("only_static", true);
 
+    // ===== Parameters (static wall map filtering) =====
+    this->declare_parameter<bool>("wall_map.enable", true);
+    this->declare_parameter<std::string>("wall_map.yaml_path", "0120.yaml");
+    this->declare_parameter<bool>("wall_map.unknown_occupied", true);
+    this->declare_parameter<int>("wall_map.occupied_threshold", 50);
+    this->declare_parameter<double>("wall_map.filter_radius", 0.10);
+
     // ===== Parameters (dynamic/static classification) =====
     this->declare_parameter<double>("dynamic_classification.match_gate", 0.6);
     this->declare_parameter<int>("dynamic_classification.min_history_frames", 3);
@@ -176,6 +184,12 @@ public:
     this->get_parameter("track_csv_has_header", track_csv_has_header_);
     this->get_parameter("only_static", only_static_);
 
+    this->get_parameter("wall_map.enable", wall_map_enable_);
+    this->get_parameter("wall_map.yaml_path", wall_map_yaml_path_);
+    this->get_parameter("wall_map.unknown_occupied", wall_map_unknown_occupied_);
+    this->get_parameter("wall_map.occupied_threshold", wall_map_occupied_threshold_);
+    this->get_parameter("wall_map.filter_radius", wall_map_filter_radius_);
+
     this->get_parameter("dynamic_classification.match_gate", dyn_match_gate_);
     this->get_parameter("dynamic_classification.min_history_frames", dyn_min_history_frames_);
     this->get_parameter("dynamic_classification.static_thresh", dyn_static_thresh_);
@@ -196,7 +210,21 @@ public:
       icp_refiner_ = std::make_shared<icp_comparator::IcpPointToPoint>(ip);
     }
 
-    detector_.loadTrackCsvPCL(track_csv_path_, true);
+    detector_.loadTrackCsvPCL(track_csv_path_, track_csv_has_header_);
+    if (wall_map_enable_) {
+      wall_map_ = std::make_unique<wall_map::StaticWallMap>(
+        wall_map_unknown_occupied_, wall_map_occupied_threshold_);
+      wall_map_loaded_ = wall_map_->load_from_yaml(wall_map_yaml_path_);
+      if (wall_map_loaded_) {
+        RCLCPP_INFO(
+          this->get_logger(), "Loaded static wall map: %s", wall_map_yaml_path_.c_str());
+      } else {
+        RCLCPP_WARN(
+          this->get_logger(),
+          "Failed to load static wall map '%s'. Wall-map filtering is disabled.",
+          wall_map_yaml_path_.c_str());
+      }
+    }
 
     // ===== Publishers =====
     static_pub_     = this->create_publisher<geometry_msgs::msg::PointStamped>("/static_obstacle", 10);
@@ -295,6 +323,59 @@ private:
     out.point.y = pw.y();
     out.point.z = pw.z();
     return out;
+  }
+
+  bool isWallMapOccupiedNear(double x, double y) const
+  {
+    if (!wall_map_enable_ || !wall_map_loaded_ || !wall_map_) {
+      return false;
+    }
+
+    const auto center_wall = wall_map_->is_wall_at(x, y);
+    if (center_wall.has_value() && center_wall.value()) {
+      return true;
+    }
+
+    const double radius = std::max(0.0, wall_map_filter_radius_);
+    if (radius <= 1e-6) {
+      return false;
+    }
+
+    const auto & map = wall_map_->map();
+    const double resolution = static_cast<double>(map.info.resolution);
+    const double step = std::max(0.02, resolution > 0.0 ? resolution : 0.05);
+
+    for (double dx = -radius; dx <= radius + 1e-9; dx += step) {
+      for (double dy = -radius; dy <= radius + 1e-9; dy += step) {
+        if ((dx * dx + dy * dy) > radius * radius) {
+          continue;
+        }
+
+        const auto is_wall = wall_map_->is_wall_at(x + dx, y + dy);
+        if (is_wall.has_value() && is_wall.value()) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  bool acceptObstacleCandidate(const geometry_msgs::msg::Point& obstacle_in_map) const
+  {
+    if (!detector_.isObstacleWithinWallPCL(obstacle_in_map)) {
+      return false;
+    }
+
+    if (isWallMapOccupiedNear(obstacle_in_map.x, obstacle_in_map.y)) {
+      RCLCPP_DEBUG(
+        this->get_logger(),
+        "[WallMapFilter] Reject obstacle at map=(%.3f, %.3f) as static wall.",
+        obstacle_in_map.x, obstacle_in_map.y);
+      return false;
+    }
+
+    return true;
   }
 
   static inline void hsvToRgb(double h, double s, double v,
@@ -519,7 +600,7 @@ private:
 
         const auto p_world = transformLocalWithPose(p, pose_used);
         geometry_msgs::msg::Point obs = p_world.point;
-        if (detector_.isObstacleWithinWallPCL(obs)) {
+        if (acceptObstacleCandidate(obs)) {
           // 유효(벽 안쪽) → centers에 push_back
           centers.push_back(p);
         }
@@ -528,7 +609,7 @@ private:
       for (const auto &pt : frame_points) {
         const auto p_world = transformLocalWithPose(pt, pose_used);
         geometry_msgs::msg::Point obs = p_world.point;
-        if (detector_.isObstacleWithinWallPCL(obs)) {
+        if (acceptObstacleCandidate(obs)) {
           centers.push_back(pt);
         }
       }
@@ -956,6 +1037,15 @@ private:
   int    min_candidates_to_process_{1};
   bool   use_weighted_median_{false};
   bool   only_static_{false};
+
+  // params/state (static wall map filtering)
+  bool wall_map_enable_{true};
+  bool wall_map_unknown_occupied_{true};
+  bool wall_map_loaded_{false};
+  int wall_map_occupied_threshold_{50};
+  double wall_map_filter_radius_{0.10};
+  std::string wall_map_yaml_path_{"0120.yaml"};
+  std::unique_ptr<wall_map::StaticWallMap> wall_map_;
 
   // params (dynamic/static classification)
   double dyn_match_gate_{0.6};

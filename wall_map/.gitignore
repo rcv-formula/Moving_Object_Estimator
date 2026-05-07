@@ -1,0 +1,39 @@
+# Build directories
+build/
+devel/
+install/
+.catkin_workspace
+
+# Compiled files
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+/dist/
+/build/
+
+# ROS
+log/
+bags/

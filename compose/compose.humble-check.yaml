@@ -1,0 +1,15 @@
+services:
+  humble_check:
+    build:
+      context: ..
+      dockerfile: containers/Dockerfile.humble-check
+    image: moving-object-estimator:humble-check
+    container_name: moe_humble_check
+    network_mode: host
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+    volumes:
+      - ..:/workspaces/Moving_Object_Estimator
+    working_dir: /workspaces/Moving_Object_Estimator
+    command: ["/bin/bash", "-c", "tail -f /dev/null"]

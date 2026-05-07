@@ -18,9 +18,16 @@ def generate_launch_description():
         'track',
         '0120_track.csv'
     )
+    wall_map_share = get_package_share_directory('wall_map')
+    default_wall_map_yaml_path = os.path.join(
+        wall_map_share,
+        'maps',
+        '0120.yaml'
+    )
 
     track_csv_path = LaunchConfiguration('track_csv_path')
     only_static = LaunchConfiguration('only_static')
+    wall_map_yaml_path = LaunchConfiguration('wall_map_yaml_path')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -32,6 +39,11 @@ def generate_launch_description():
             'only_static',
             default_value='true',
             description='When true, classify all valid obstacles as static.'
+        ),
+        DeclareLaunchArgument(
+            'wall_map_yaml_path',
+            default_value=default_wall_map_yaml_path,
+            description='Path to occupancy-map YAML used to reject wall detections.'
         ),
         Node(
             package='object_detector',
@@ -50,6 +62,7 @@ def generate_launch_description():
                 {
                     'track_csv_path': track_csv_path,
                     'only_static': ParameterValue(only_static, value_type=bool),
+                    'wall_map.yaml_path': wall_map_yaml_path,
                 }
             ]
         ),

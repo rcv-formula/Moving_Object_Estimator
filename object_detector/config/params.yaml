@@ -41,6 +41,13 @@ obstacle_detector_node:
     track_csv_has_header: true
     only_static: true
 
+    wall_map:
+      enable: true
+      yaml_path: "0120.yaml"
+      unknown_occupied: true
+      occupied_threshold: 50
+      filter_radius: 0.10
+
     dynamic_classification:
       match_gate: 0.6             # (m) 과거 프레임에서 현재 center와 같은 장애물 후보로 볼 최대 거리
       min_history_frames: 3       # (개) 정적/동적을 판단하기 위한 최소 과거 매칭 프레임 수

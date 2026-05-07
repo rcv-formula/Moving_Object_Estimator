@@ -32,6 +32,8 @@ find_package(message_filters REQUIRED)          # ★ 사용함
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(wall_map REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
 find_package(PCL REQUIRED COMPONENTS common io filters visualization)
 find_package(pcl_conversions REQUIRED)
@@ -79,9 +81,9 @@ add_dependencies(scan_processor_node ${PROJECT_NAME}__rosidl_typesupport_cpp)  #
 add_executable(obstacle_detector_node src/obstacle_detector_node.cpp)
 ament_target_dependencies(obstacle_detector_node
   rclcpp geometry_msgs nav_msgs visualization_msgs
-  pcl_conversions tf2_ros tf2_geometry_msgs
+  pcl_conversions tf2_ros tf2_geometry_msgs wall_map
 )
-target_link_libraries(obstacle_detector_node object_detector_headers ${PCL_LIBRARIES})
+target_link_libraries(obstacle_detector_node object_detector_headers ${PCL_LIBRARIES} yaml-cpp)
 rosidl_target_interfaces(obstacle_detector_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
 add_dependencies(obstacle_detector_node ${PROJECT_NAME}__rosidl_typesupport_cpp)
 
@@ -124,6 +126,7 @@ ament_export_dependencies(
   rclcpp std_msgs sensor_msgs geometry_msgs nav_msgs
   visualization_msgs message_filters
   tf2 tf2_ros tf2_geometry_msgs
+  wall_map
   PCL pcl_conversions Eigen3
 )
 
