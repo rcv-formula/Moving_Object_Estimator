@@ -7,19 +7,19 @@ scan_processor_node:
     scan_angle_max: 2.35619         # (rad) 스캔 데이터에서 고려할 최대 각도 (π/2 ≒ 1.5708 rad)
 
     # DBSCAN 클러스터링 관련 파라미터
-    min_cluster_points: 3        # (개) DBSCAN 클러스터링 시 하나의 클러스터로 인식하기 위한 최소 점 개수
-    dbscan_epsilon: 0.03           # (m) 두 점 사이의 최대 거리 기준 (eps 값)
+    min_cluster_points: 6        # (개) DBSCAN 클러스터링 시 하나의 클러스터로 인식하기 위한 최소 점 개수
+    dbscan_epsilon: 0.1           # (m) 두 점 사이의 최대 거리 기준 (eps 값)
     dbscan_max_points: 100         # (개) DBSCAN 클러스터링 시 하나의 클러스터로 인식하기 위한 최대 점 개수
 
     # 벽 필터링 관련 파라미터
     wall_distance_threshold: 0.06  # (m) 연속된 스캔 점 사이의 최대 거리 – 이 값 이하이면 같은 그룹으로 묶음
     wall_line_max_error: 0.005     # (m) 그룹 내 점들을 직선으로 근사할 때 허용하는 최대 오차
     min_wall_cluster_points: 6     # (개) 벽으로 판단하기 위한 그룹 내 최소 점 개수
-    wall_length_threshold: 0.35    # (m) 그룹 선분 길이가 이 값보다 크면 벽으로 간주
+    wall_length_threshold: 0.55    # (m) 그룹 선분 길이가 이 값보다 크면 벽으로 간주
 
     # 멀리 있는 장애물 필터링 관련 파라미터
     far_obstacle_distance_threshold: 4.5  # (m) 센서로부터의 거리가 이 값 이상이면 '멀리 있는 장애물'로 판단
-    far_obstacle_min_points: 12            # (개) 멀리 있는 장애물로 인식하기 위한 최소 스캔 점 개수
+    far_obstacle_min_points: 4            # (개) 멀리 있는 장애물로 인식하기 위한 최소 스캔 점 개수
     dynamic_wall_gap_factor: 2.8           # (가중치) 먼 거리 벽 그룹화를 위한 동적 임계값 배율
     
     sor_mean_k: 8
@@ -35,3 +35,14 @@ obstacle_detector_node:
     kalman_measurement_noise: 0.05  # (m², m²/s²) 칼만 필터의 업데이트 단계에서 측정치의 노이즈(불확실성)를 나타내는 값
     use_kalman_filter: true        # () kalman filter 적용 여부
     obstacle_timeout: 0.03          # (초) 이 시간동안 측정값이 없으면 장애물 없음으로 간주
+
+    track_csv_path: "/home/rcv/object_detector/track/0120_track.csv"
+    # track_csv_path: "/root/moving_object_estimator_ws/object_detector/track/day1_track.csv"
+    track_csv_has_header: true
+    only_static: true
+
+    dynamic_classification:
+      match_gate: 0.6             # (m) 과거 프레임에서 현재 center와 같은 장애물 후보로 볼 최대 거리
+      min_history_frames: 3       # (개) 정적/동적을 판단하기 위한 최소 과거 매칭 프레임 수
+      static_thresh: 0.10         # (m) median 이동량이 이 값 이하면 정적
+      dynamic_thresh: 0.30        # (m) median 이동량이 이 값 이상이면 동적, 중간은 UNKNOWN

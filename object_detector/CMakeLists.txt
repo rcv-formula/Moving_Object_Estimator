@@ -4,10 +4,18 @@ project(object_detector)
 # --- (선택) MPI 고정: 필요 없으면 제거 가능 ---
 set(MPI_C_COMPILER "/usr/bin/mpicc" CACHE FILEPATH "MPI C compiler path")
 set(MPI_CXX_COMPILER "/usr/bin/mpicxx" CACHE FILEPATH "MPI C++ compiler path")
-set(MPI_HOME "/usr/lib/aarch64-linux-gnu/openmpi" CACHE PATH "MPI home path")
+if(NOT DEFINED MPI_HOME)
+  if(DEFINED CMAKE_LIBRARY_ARCHITECTURE AND EXISTS "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/openmpi")
+    set(MPI_HOME "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/openmpi" CACHE PATH "MPI home path")
+  elseif(EXISTS "/usr/lib/aarch64-linux-gnu/openmpi")
+    set(MPI_HOME "/usr/lib/aarch64-linux-gnu/openmpi" CACHE PATH "MPI home path")
+  elseif(EXISTS "/usr/lib/x86_64-linux-gnu/openmpi")
+    set(MPI_HOME "/usr/lib/x86_64-linux-gnu/openmpi" CACHE PATH "MPI home path")
+  endif()
+endif()
 set(CMAKE_IGNORE_PREFIX_PATH "/opt/hpcx" CACHE PATH "Ignore broken HPCX path")
 find_package(MPI REQUIRED COMPONENTS C CXX)
-include_directories(${MPI_C_INCLUDE_PATH})
+include_directories(${MPI_C_INCLUDE_DIRS} ${MPI_CXX_INCLUDE_DIRS})
 
 # --- ament & ROS deps ---
 find_package(ament_cmake REQUIRED)
@@ -107,7 +115,7 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/ DESTINATION include)
-install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch config track DESTINATION share/${PROJECT_NAME})
 
 # --- export: 런타임에 필요한 훅/경로 노출 ---
 ament_export_include_directories(include ${PCL_INCLUDE_DIRS})

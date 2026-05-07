@@ -9,6 +9,8 @@
 #include <vector>
 #include <limits>
 #include <algorithm>
+#include <cstdint>
+#include <unordered_map>
 #include "object_detector/msg/marker_array_stamped.hpp"
 
 // PCL
@@ -92,7 +94,7 @@ public:
     scan_mf_sub_.subscribe(this, "/scan", rmw_qos);
     odom_mf_sub_.subscribe(this, "/odom", rmw_qos);
 
-    sync_ = std::make_shared<message_filters::Synchronizer<ApproxPolicy>>(ApproxPolicy(50), scan_mf_sub_, odom_mf_sub_);
+    sync_ = std::make_shared<message_filters::Synchronizer<ApproxPolicy>>(ApproxPolicy(1000), scan_mf_sub_, odom_mf_sub_);
     sync_->registerCallback(std::bind(&ScanProcessor::syncCallback, this,
                                       std::placeholders::_1, std::placeholders::_2));
   }
@@ -120,13 +122,9 @@ private:
       if (r < scan_range_min_ || r > scan_range_max_ ||
           a < scan_angle_min_ || a > scan_angle_max_ ||
           !std::isfinite(r)) continue;
-      
-      double px = r * std::cos(a);
-      double py = r * std::sin(a);
-      
-      if(px < 0.0) continue;
-      
-      local_points.push_back({px, py, 0.0f});
+      double x = r * std::cos(a);
+      double y = r * std::sin(a);
+      if(x > 0) local_points.push_back({x, y, 0.0f});
     }
 
     // 센서 원점(로컬)
@@ -261,14 +259,42 @@ private:
     std::vector<int> cluster_ids(n, -1);
     int cluster_id = 0;
     const double eps_sq = eps * eps;
+    const double cell_size = std::max(eps, 1e-9);
+
+    auto cellCoord = [cell_size](double v) -> int {
+      return static_cast<int>(std::floor(v / cell_size));
+    };
+
+    auto cellKey = [](int cx, int cy) -> std::uint64_t {
+      return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(cx)) << 32) |
+             static_cast<std::uint32_t>(cy);
+    };
+
+    std::unordered_map<std::uint64_t, std::vector<int>> grid;
+    grid.reserve(static_cast<size_t>(n) * 2);
+    for (int i = 0; i < n; ++i) {
+      const int cx = cellCoord(points[i].x);
+      const int cy = cellCoord(points[i].y);
+      grid[cellKey(cx, cy)].push_back(i);
+    }
 
     auto regionQuery = [&](int idx) {
       std::vector<int> ret; ret.reserve(32);
-      for (int j = 0; j < n; ++j) {
-        if (j == idx) continue;
-        const double dx = points[idx].x - points[j].x;
-        const double dy = points[idx].y - points[j].y;
-        if (dx*dx + dy*dy <= eps_sq) ret.push_back(j);
+      const int cx = cellCoord(points[idx].x);
+      const int cy = cellCoord(points[idx].y);
+
+      for (int ox = -1; ox <= 1; ++ox) {
+        for (int oy = -1; oy <= 1; ++oy) {
+          const auto it = grid.find(cellKey(cx + ox, cy + oy));
+          if (it == grid.end()) continue;
+
+          for (int j : it->second) {
+            if (j == idx) continue;
+            const double dx = points[idx].x - points[j].x;
+            const double dy = points[idx].y - points[j].y;
+            if (dx*dx + dy*dy <= eps_sq) ret.push_back(j);
+          }
+        }
       }
       return ret;
     };

@@ -8,9 +8,9 @@
  *      과거 오브젝트 점들을 현재 프레임(=현재 포즈 기준 로컬 좌표계)로 변환하여 프레임별 점 리스트 반환
  *  - publishAlignedFramesMarkers(aligned_frames, frame_id, stamp, pub, point_scale, alpha):
  *      정렬된 과거 오브젝트 프레임들을 MarkerArray로 시각화
- *  - classifyDynamicByFootprint(target, aligned_frames, eps, minPts, search_radius, exclude_current, motion_thresh, out_footprint, out_span):
- *      현재 타깃과 **반경 내에서 수집된 과거 프레임 점들** 사이의 최대 거리로 동적(1)/정적(0) 분류.
- *      단, 반경 내에서 실제로 수집된 **서로 다른 과거 프레임 수 ≤ 5**이면 UNKNOWN(-1).
+ *  - classifyDynamicByFootprint(target, aligned_frames, static_thresh, min_history_frames, match_gate, exclude_current, dynamic_thresh, out_footprint, out_span):
+ *      현재 타깃과 과거 프레임별 nearest center의 median 이동량으로 동적/정적을 분류.
+ *      유효 매칭 프레임이 부족하거나 static/dynamic threshold 사이면 UNKNOWN.
  *  - visualizeFootprint(footprint, label, frame_id, id, stamp, pub):
  *      footprint를 MarkerArray로 시각화
  */
@@ -31,12 +31,175 @@
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/kdtree/kdtree_flann.h>
+
 class DynamicObjectDetector {
 public:
   // 라벨 정의: UNKNOWN=0, STATIC=1, DYNAMIC=2
   enum Label { UNKNOWN=0, STATIC=1, DYNAMIC=2 };
 
   DynamicObjectDetector() = default;
+
+    inline bool loadTrackCsvPCL(const std::string& csv_path, bool has_header=true)
+    {
+      track_cloud_.reset(new pcl::PointCloud<pcl::PointXYZI>());
+      kdtree_pcl_.reset(new pcl::KdTreeFLANN<pcl::PointXYZI>());
+
+      std::ifstream ifs(csv_path);
+      if (!ifs.is_open()) {
+        RCLCPP_ERROR(rclcpp::get_logger("DynamicObjectDetector"),
+                    "Failed to open CSV (PCL): %s", csv_path.c_str());
+        track_cloud_.reset();
+        kdtree_pcl_.reset();
+        return false;
+      }
+
+      std::string line;
+      if (has_header) std::getline(ifs, line); // 헤더 스킵 (열 순서 고정)
+
+      size_t line_no = has_header ? 2 : 1;
+      while (std::getline(ifs, line)) {
+        if (line.empty()) { ++line_no; continue; }
+        std::stringstream ss(line);
+        std::string cell;
+        std::vector<std::string> cols;
+        while (std::getline(ss, cell, ',')) cols.push_back(cell);
+
+        auto to_double = [](const std::string& s, double& out)->bool{
+          try { out = std::stod(s); return true; }
+          catch(...) { out = std::numeric_limits<double>::quiet_NaN(); return false; }
+        };
+
+        double x=0.0, y=0.0, w=std::numeric_limits<double>::quiet_NaN();
+        bool ok = true;
+        ok &= to_double(cols[0], x);
+        ok &= to_double(cols[1], y);
+        ok &= to_double(cols[2], w);
+
+        if (!ok || std::isnan(x) || std::isnan(y) || std::isnan(w)) {
+          RCLCPP_WARN(rclcpp::get_logger("DynamicObjectDetector"),
+                      "CSV line %zu parse failed (x/y/w). Skip.", line_no);
+          ++line_no; continue;
+        }
+
+        pcl::PointXYZI pt;
+        pt.x = static_cast<float>(x);
+        pt.y = static_cast<float>(y);
+        pt.z = 0.0f;                           // 2D 트랙 가정
+        pt.intensity = static_cast<float>(w);   // intensity에 '벽까지 거리' 저장
+        track_cloud_->push_back(pt);
+
+        ++line_no;
+      }
+
+      kdtree_pcl_->setInputCloud(track_cloud_);
+      RCLCPP_INFO(rclcpp::get_logger("DynamicObjectDetector"),
+                  "Loaded %zu center points (PCL) and built KD-Tree.",
+                  track_cloud_->size());
+      return true;
+    }
+  
+  inline visualization_msgs::msg::Marker makeWallLineMarker() const
+  {
+    visualization_msgs::msg::Marker m;
+    m.header.frame_id = "map";
+    m.header.stamp = rclcpp::Clock().now();
+    m.ns = "wall_line";
+    m.id = 0;
+    m.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    m.action = visualization_msgs::msg::Marker::ADD;
+    m.scale.x = 0.05;
+  
+    m.color.r = 1.0;
+    m.color.g = 0.6;
+    m.color.b = 0.0;
+    m.color.a = 1.0;
+  
+    if (!track_cloud_ || track_cloud_->empty())
+      return m;
+    std::vector<geometry_msgs::msg::Point> tmp_right;
+
+    for (size_t i = 0; i < track_cloud_->size(); ++i) {
+      const auto& pt = (*track_cloud_)[i];
+    
+      // 이전 점과 다음 점으로부터 진행방향 추정
+      Eigen::Vector2d dir(1.0, 0.0);
+      if (i + 1 < track_cloud_->size()) {
+        const auto& next = (*track_cloud_)[i + 1];
+        dir << next.x - pt.x, next.y - pt.y;
+      } else if (i > 0) {
+        const auto& prev = (*track_cloud_)[i - 1];
+        dir << pt.x - prev.x, pt.y - prev.y;
+      }
+      if (dir.norm() > 1e-6)
+        dir.normalize();
+    
+      // 법선 방향 (좌우)
+      Eigen::Vector2d normal(-dir.y(), dir.x());
+    
+      // 벽 거리 (intensity)
+      double w = static_cast<double>(pt.intensity) - 0.2;
+    
+      // 좌우 점 생성
+      geometry_msgs::msg::Point left, right;
+      left.x  = pt.x + normal.x() * w;
+      left.y  = pt.y + normal.y() * w;
+      left.z  = pt.z;
+    
+      right.x = pt.x - normal.x() * w;
+      right.y = pt.y - normal.y() * w;
+      right.z = pt.z;
+    
+      // 왼쪽-오른쪽 순으로 추가 (시각적으로 띠 형태)
+      m.points.push_back(left);
+      tmp_right.emplace_back(right);
+    }
+    for(auto r : tmp_right){
+      m.points.push_back(r);
+    }
+    
+    return m;
+  }
+
+  inline bool isObstacleWithinWallPCL(const geometry_msgs::msg::Point& obstacle_in_map) const
+  {
+    if (!track_cloud_ || !kdtree_pcl_ || track_cloud_->empty()) {
+      RCLCPP_WARN(rclcpp::get_logger("DynamicObjectDetector"),
+                  "Track CSV (PCL) not loaded. Treat obstacle as valid.");
+      return true; // 인덱스가 없으면 무효 판정 불가 → 유효 처리
+    }
+
+    pcl::PointXYZI query;
+    query.x = static_cast<float>(obstacle_in_map.x);
+    query.y = static_cast<float>(obstacle_in_map.y);
+    query.z = 0.0f;
+
+    std::vector<int> knn_idx(1);
+    std::vector<float> knn_d2(1);
+
+    const int found = kdtree_pcl_->nearestKSearch(query, 1, knn_idx, knn_d2);
+    if (found <= 0 || knn_idx[0] < 0 || static_cast<size_t>(knn_idx[0]) >= track_cloud_->size()) {
+      RCLCPP_WARN(rclcpp::get_logger("DynamicObjectDetector"),
+                  "PCL KD-Tree query failed. Treat obstacle as valid.");
+      return true;
+    }
+
+    const pcl::PointXYZI& nn = (*track_cloud_)[knn_idx[0]];
+    std::cout << knn_idx[0] <<"\n";
+    const double d_center_obs = std::sqrt(static_cast<double>(knn_d2[0]));
+    const double wall_dist    = static_cast<double>(nn.intensity);
+
+    const bool valid = (d_center_obs <= wall_dist - 0.5); // 여유 10cm
+
+    RCLCPP_DEBUG(rclcpp::get_logger("DynamicObjectDetector"),
+                 "[PCL ObstacleCheck] nn=(%.3f,%.3f) obs=(%.3f,%.3f) d=%.3f wall=%.3f -> %s",
+                 nn.x, nn.y, query.x, query.y, d_center_obs, wall_dist,
+                 valid ? "VALID" : "INVALID");
+    return valid;
+  }
 
   // === 과거 obj (map 좌표) → 현재 프레임(현재 포즈 기준 로컬 좌표)로 정렬 ===
   std::vector<std::vector<geometry_msgs::msg::Point>>
@@ -114,106 +277,91 @@ public:
   }
 
   /**
-   * @brief footprint 기반 분류 (UNKNOWN=-1, STATIC=0, DYNAMIC=1)
+   * @brief 현재 center와 과거 프레임별 nearest center를 비교해 정적/동적을 분류.
    *
-   * 절차(현재↔과거 최대거리 + 반경 내 과거 프레임 수 검증):
-   *  1) `aligned_frames`의 마지막 인덱스를 현재 프레임으로 가정.
-   *  2) target(현재 프레임 좌표계) 주변 `search_radius` 내 footprint 점 수집.
-   *  3) footprint 중 **서로 다른 과거 프레임 인덱스**의 개수를 센다(현재 프레임 제외).
-   *     - 이 개수가 **5 이하**이면 UNKNOWN(-1) 반환.
-   *  4) 과거 프레임 점들과 target 사이의 **최대 거리(move_max)** 계산.
-   *     - `move_max >= motion_thresh` → DYNAMIC(1), 아니면 STATIC(0).
-   *  5) `out_span`은 footprint의 x범위(max−min)를 반환(분류에는 미사용).
+   * aligned_frames는 현재 프레임을 포함하지 않는 과거 프레임 목록이다.
+   * 각 과거 프레임에서 target과 가장 가까운 center 1개만 사용하고, match_gate 밖이면 버린다.
+   * 유효 매칭 수가 부족하면 UNKNOWN, median 이동량이 작으면 STATIC, 크면 DYNAMIC이다.
    */
   int classifyDynamicByFootprint(
       const geometry_msgs::msg::Point& target_in_current,
       const std::vector<std::vector<geometry_msgs::msg::Point>>& aligned_frames,
-      double eps,                 // (미사용)
-      int /*minPts*/,             // (미사용)
-      double search_radius,
-      bool   /*exclude_current*/, // (미사용)
-      double motion_thresh,
+      double static_thresh,
+      int min_history_frames,
+      double match_gate,
+      bool   /*exclude_current*/,
+      double dynamic_thresh,
       std::vector<geometry_msgs::msg::Point>* out_footprint,
       double* out_span) const
   {
-    (void)eps;
+    if (out_footprint) out_footprint->clear();
+    if (out_span) *out_span = 0.0;
+
     if (aligned_frames.empty()) return UNKNOWN;
 
-    const int current_idx = static_cast<int>(aligned_frames.size()) - 1;
+    std::vector<geometry_msgs::msg::Point> nearest_points;
+    std::vector<double> dist_vec;
+    nearest_points.reserve(aligned_frames.size());
+    dist_vec.reserve(aligned_frames.size());
 
-    // (B) 반경 내 footprint 수집 (프레임 인덱스 포함)
-    std::vector<std::pair<geometry_msgs::msg::Point, int>> footprint_idx; // (점, 프레임인덱스)
-    const double R2 = search_radius * search_radius;
-    for (size_t f = 0; f < aligned_frames.size(); ++f) {
-      for (const auto& p : aligned_frames[f]) {
+    const double gate2 = match_gate * match_gate;
+    for (const auto& frame : aligned_frames) {
+      bool found = false;
+      geometry_msgs::msg::Point nearest;
+      double best_d2 = std::numeric_limits<double>::infinity();
+
+      for (const auto& p : frame) {
         const double dx = p.x - target_in_current.x;
         const double dy = p.y - target_in_current.y;
         const double dz = p.z - target_in_current.z;
         const double d2 = dx*dx + dy*dy + dz*dz;
-        if (d2 <= R2) footprint_idx.emplace_back(p, static_cast<int>(f));
+        if (d2 < best_d2) {
+          best_d2 = d2;
+          nearest = p;
+          found = true;
+        }
+      }
+
+      if (found && best_d2 <= gate2) {
+        nearest_points.push_back(nearest);
+        dist_vec.push_back(std::sqrt(best_d2));
       }
     }
 
-    if (out_footprint) {
-      out_footprint->clear();
-      out_footprint->reserve(footprint_idx.size());
-      for (const auto& kv : footprint_idx) out_footprint->push_back(kv.first);
-    }
-
     if (out_span) {
-      if (footprint_idx.empty()) *out_span = 0.0;
+      if (nearest_points.empty()) *out_span = 0.0;
       else {
         double xmin=+1e9, xmax=-1e9;
-        for (const auto& kv : footprint_idx) {
-          xmin = std::min(xmin, kv.first.x);
-          xmax = std::max(xmax, kv.first.x);
+        for (const auto& p : nearest_points) {
+          xmin = std::min(xmin, p.x);
+          xmax = std::max(xmax, p.x);
         }
         *out_span = (xmax - xmin);
       }
     }
 
-    // (C) 반경 내 footprint가 포함하는 **서로 다른 과거 프레임 수** 계산
-    std::unordered_set<int> past_frames_in_footprint;
-    for (const auto& kv : footprint_idx) {
-      const int f = kv.second;
-      if (f != current_idx) past_frames_in_footprint.insert(f);
+    if (out_footprint) {
+      out_footprint->reserve(nearest_points.size());
+      for (const auto& p : nearest_points) out_footprint->push_back(p);
     }
-    // 과거 프레임 수가 2개 이하라면 UNKNOWN
-    if (static_cast<int>(past_frames_in_footprint.size()) <= 3) {
+
+    if (static_cast<int>(dist_vec.size()) < std::max(1, min_history_frames)) {
       return UNKNOWN;
     }
 
-    // (D) 현재 타깃 ↔ 과거 프레임 점들 간 최대 거리
-    double move_sum = 0.0;
-    double move_avg = 0.0;
-    bool   found_past = false;
-    std::vector<double> dist_vec;
-    
-    for (const auto& kv : footprint_idx) {
-      const int f = kv.second;
-      if (f == current_idx) continue;  // 과거만 확인
-      const auto& p = kv.first;
-      const double d = hypot3(p, target_in_current);
-      dist_vec.emplace_back(d);
-      found_past = true;
-    }
-    
-    if (!found_past) {
-      // 반경 내 점이 모두 현재 프레임뿐이면 과거 대비가 불가 → UNKNOWN이 타당
-      return UNKNOWN;
-    }
+    std::sort(dist_vec.begin(), dist_vec.end());
+    const double median = dist_vec[dist_vec.size() / 2];
 
-    std::sort(dist_vec.begin(),dist_vec.end(),std::greater<double>());
+    if (median <= static_thresh) return STATIC;
+    if (median >= dynamic_thresh) return DYNAMIC;
 
-    if(dist_vec.size() >= 3 && dist_vec[0] < motion_thresh && dist_vec[1] < motion_thresh) return STATIC;
-
-    return DYNAMIC;
+    return UNKNOWN;
   }
 
   // === footprint 시각화 ===
   void visualizeFootprint(
       const std::vector<geometry_msgs::msg::Point>& footprint,
-      int dyn_label,                         // -1=unknown, 0=static, 1=dynamic
+      int dyn_label,                         // 0=unknown, 1=static, 2=dynamic
       const std::string& frame_id,
       int id_base,
       const builtin_interfaces::msg::Time& stamp,
@@ -274,6 +422,10 @@ public:
   }
 
 private:
+  
+pcl::PointCloud<pcl::PointXYZI>::Ptr track_cloud_{nullptr};
+  std::unique_ptr<pcl::KdTreeFLANN<pcl::PointXYZI>> kdtree_pcl_{nullptr};
+
   static Eigen::Matrix4d poseToT(const geometry_msgs::msg::Pose &pose)
   {
     Eigen::Quaterniond q(pose.orientation.w,

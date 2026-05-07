@@ -32,6 +32,8 @@
 #include <tuple>
 #include <optional>
 #include <chrono>
+#include <cstdint>
+#include <unordered_map>
 
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -127,6 +129,16 @@ public:
     this->declare_parameter<double>("kf_gate_dist", 0.4);          // [m] gating
     this->declare_parameter<double>("kf_reset_timeout_sec", 0.20);  // [s] ≈ 2 frames at 20Hz
 
+    this->declare_parameter<std::string>("track_csv_path", "/home/rcv/Desktop/object_detector/track/1103_track.csv");
+    this->declare_parameter<bool>("track_csv_has_header", true);
+    this->declare_parameter<bool>("only_static", true);
+
+    // ===== Parameters (dynamic/static classification) =====
+    this->declare_parameter<double>("dynamic_classification.match_gate", 0.6);
+    this->declare_parameter<int>("dynamic_classification.min_history_frames", 3);
+    this->declare_parameter<double>("dynamic_classification.static_thresh", 0.10);
+    this->declare_parameter<double>("dynamic_classification.dynamic_thresh", 0.30);
+
     // ===== Load Parameters =====
     this->get_parameter("dbscan_eps", dbscan_eps_);
     this->get_parameter("dbscan_min_points", dbscan_min_points_);
@@ -160,6 +172,15 @@ public:
     this->get_parameter("kf_gate_dist", kf_gate_dist_);
     this->get_parameter("kf_reset_timeout_sec", kf_reset_timeout_sec_);
 
+    this->get_parameter("track_csv_path", track_csv_path_);
+    this->get_parameter("track_csv_has_header", track_csv_has_header_);
+    this->get_parameter("only_static", only_static_);
+
+    this->get_parameter("dynamic_classification.match_gate", dyn_match_gate_);
+    this->get_parameter("dynamic_classification.min_history_frames", dyn_min_history_frames_);
+    this->get_parameter("dynamic_classification.static_thresh", dyn_static_thresh_);
+    this->get_parameter("dynamic_classification.dynamic_thresh", dyn_dynamic_thresh_);
+
     // ===== ICP Refiner init =====
     {
       icp_comparator::IcpParams ip;
@@ -175,6 +196,8 @@ public:
       icp_refiner_ = std::make_shared<icp_comparator::IcpPointToPoint>(ip);
     }
 
+    detector_.loadTrackCsvPCL(track_csv_path_, true);
+
     // ===== Publishers =====
     static_pub_     = this->create_publisher<geometry_msgs::msg::PointStamped>("/static_obstacle", 10);
     dynamic_pub_    = this->create_publisher<nav_msgs::msg::Odometry>(dynamic_odom_topic_, 20);
@@ -183,6 +206,10 @@ public:
     current_scan_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/current_scan_pcl", 10);
     icp_aligned_hist_pub_   = this->create_publisher<sensor_msgs::msg::PointCloud2>("/icp_aligned_hist_cloud", 5);
     icp_frames_markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/icp_frames_markers", 5);
+    wall_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("/track_wall_marker", 1);
+
+    // ===== Detection node check =====
+    RCLCPP_INFO(this->get_logger(), "ObstacleDetector node mode:: %s", only_static_ ? "ONLY STATIC":"DYNAMIC+STATIC");
 
     // ===== ExactTime 3-way sync =====
     proc_scan_sub_.subscribe(this, processed_scan_topic_.c_str(), rmw_qos_profile_sensor_data);
@@ -203,6 +230,9 @@ private:
   using PointT   = pcl::PointXYZI;
   using Cloud    = pcl::PointCloud<PointT>;
   using CloudPtr = Cloud::Ptr;
+
+  std::string track_csv_path_;
+  bool track_csv_has_header_{true};
 
   static CloudPtr toCloud(const sensor_msgs::msg::PointCloud2& pc2) {
     CloudPtr c(new Cloud);
@@ -294,14 +324,46 @@ private:
     std::vector<int> cluster_ids(N, -1);
 
     const int effective_min_pts = std::max(1, dbscan_min_points_);
-    auto distance = [&](size_t i, size_t j) -> double {
+    const double eps_sq = dbscan_eps_ * dbscan_eps_;
+    const double cell_size = std::max(dbscan_eps_, 1e-9);
+
+    auto cellCoord = [cell_size](double v) -> int {
+      return static_cast<int>(std::floor(v / cell_size));
+    };
+
+    auto cellKey = [](int cx, int cy) -> std::uint64_t {
+      return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(cx)) << 32) |
+             static_cast<std::uint32_t>(cy);
+    };
+
+    std::unordered_map<std::uint64_t, std::vector<size_t>> grid;
+    grid.reserve(N * 2);
+    for (size_t i = 0; i < N; ++i) {
+      const int cx = cellCoord(pts[i].point.x);
+      const int cy = cellCoord(pts[i].point.y);
+      grid[cellKey(cx, cy)].push_back(i);
+    }
+
+    auto distanceSquared = [&](size_t i, size_t j) -> double {
       const auto &a = pts[i].point, &b = pts[j].point;
       const double dx = a.x - b.x, dy = a.y - b.y;
-      return std::sqrt(dx*dx + dy*dy);
+      return dx*dx + dy*dy;
     };
     auto regionQuery = [&](size_t i) -> std::vector<size_t> {
       std::vector<size_t> nbs;
-      for (size_t j = 0; j < N; ++j) if (distance(i, j) <= dbscan_eps_) nbs.push_back(j);
+      const int cx = cellCoord(pts[i].point.x);
+      const int cy = cellCoord(pts[i].point.y);
+
+      for (int ox = -1; ox <= 1; ++ox) {
+        for (int oy = -1; oy <= 1; ++oy) {
+          const auto it = grid.find(cellKey(cx + ox, cy + oy));
+          if (it == grid.end()) continue;
+
+          for (size_t j : it->second) {
+            if (distanceSquared(i, j) <= eps_sq) nbs.push_back(j);
+          }
+        }
+      }
       return nbs;
     };
 
@@ -411,6 +473,10 @@ private:
     // (0) visualize current scan
     current_scan_pub_->publish(*processed_scan);
     
+    if(wall_pub_){
+      auto marker = detector_.makeWallLineMarker();
+      wall_pub_->publish(marker);
+    }
 
     // (1) markers → points
     std::vector<geometry_msgs::msg::PointStamped> frame_points;
@@ -443,75 +509,98 @@ private:
     auto clusters = performDBSCAN(frame_points);
     std::vector<geometry_msgs::msg::PointStamped> centers;
     centers.reserve(std::max<size_t>(1, clusters.size()));
+
     if (!clusters.empty()) {
       for (const auto &c : clusters) {
         auto [cx, cy] = computeRepresentativePoint(c, frame_points);
         geometry_msgs::msg::PointStamped p;
         p.header = frame_points[c.front()].header;
         p.point.x = cx; p.point.y = cy; p.point.z = 0.0;
-        centers.push_back(p);
+
+        const auto p_world = transformLocalWithPose(p, pose_used);
+        geometry_msgs::msg::Point obs = p_world.point;
+        if (detector_.isObstacleWithinWallPCL(obs)) {
+          // 유효(벽 안쪽) → centers에 push_back
+          centers.push_back(p);
+        }
       }
     } else {
-      for (const auto &pt : frame_points) centers.push_back(pt);
+      for (const auto &pt : frame_points) {
+        const auto p_world = transformLocalWithPose(pt, pose_used);
+        geometry_msgs::msg::Point obs = p_world.point;
+        if (detector_.isObstacleWithinWallPCL(obs)) {
+          centers.push_back(pt);
+        }
+      }
     }
 
-    // (3) align history to current
-    const auto triplets = map_manager_.snapshot_triplets();
     std::vector<std::vector<geometry_msgs::msg::Point>> aligned_frames;
-    aligned_frames.reserve(triplets.size());
 
-    const Eigen::Matrix4d T_world_curr = poseToT(pose_used);
-    const Eigen::Matrix4d T_curr_world = T_world_curr.inverse();
+    // (3) align history to current only when dynamic classification needs it
+    if (!only_static_) {
+      const auto triplets = map_manager_.snapshot_triplets();
+      const size_t max_history = static_cast<size_t>(std::max(0, icp_max_history_));
+      const size_t start_idx =
+        (max_history > 0 && triplets.size() > max_history) ? (triplets.size() - max_history) : 0;
+      aligned_frames.reserve(triplets.size() - start_idx);
 
-    CloudPtr curr = toCloud(*processed_scan);
-    Cloud concat_aligned_curr;
+      const Eigen::Matrix4d T_world_curr = poseToT(pose_used);
+      const Eigen::Matrix4d T_curr_world = T_world_curr.inverse();
 
-    for (const auto &tr : triplets) {
-      const auto &scan_hist      = std::get<0>(tr);
-      const auto &pose_hist      = std::get<2>(tr);
-      const auto &obs_local_hist = std::get<1>(tr);
+      CloudPtr curr = toCloud(*processed_scan);
+      Cloud concat_aligned_curr;
 
-      const Eigen::Matrix4d T_world_hist = poseToT(pose_hist);
-      const Eigen::Matrix4d T_curr_hist  = T_curr_world * T_world_hist;
-      
-      //icp 보정 수행 -> return fitness
-      double fitness = std::numeric_limits<double>::infinity();
-      Eigen::Matrix4f icp_pose =
-          icp_refiner_->refine(/*target=*/scan_hist, /*source=*/curr,
-                               T_curr_hist.cast<float>(), &fitness);
+      for (size_t ti = start_idx; ti < triplets.size(); ++ti) {
+        const auto &tr = triplets[ti];
+        const auto &scan_hist      = std::get<0>(tr);
+        const auto &pose_hist      = std::get<2>(tr);
+        const auto &obs_local_hist = std::get<1>(tr);
 
-      if(fitness > icp_gate_fitness_) continue;
+        const Eigen::Matrix4d T_world_hist = poseToT(pose_hist);
+        const Eigen::Matrix4d T_curr_hist  = T_curr_world * T_world_hist;
 
-      Cloud aligned_in_curr;
-      pcl::transformPointCloud(*scan_hist, aligned_in_curr, icp_pose);
-      concat_aligned_curr += aligned_in_curr;
+        Eigen::Matrix4f icp_pose = T_curr_hist.cast<float>();
+        double fitness = 0.0;
+        if (icp_enable_) {
+          fitness = std::numeric_limits<double>::infinity();
+          icp_pose = icp_refiner_->refine(
+              /*target=*/scan_hist, /*source=*/curr,
+              T_curr_hist.cast<float>(), &fitness);
 
-      if (icp_aligned_hist_pub_) {
+          if(fitness > icp_gate_fitness_) continue;
+        }
+
+        Cloud aligned_in_curr;
+        pcl::transformPointCloud(*scan_hist, aligned_in_curr, icp_pose);
+        concat_aligned_curr += aligned_in_curr;
+
+        std::vector<geometry_msgs::msg::Point> pts_curr;
+        pts_curr.reserve(obs_local_hist.size());
+        for (const auto &ps : obs_local_hist) {
+          Eigen::Vector4d pl(ps.point.x, ps.point.y, ps.point.z, 1.0);
+          Eigen::Vector4d pc = icp_pose.cast<double>() * pl;
+          geometry_msgs::msg::Point q; q.x = pc.x(); q.y = pc.y(); q.z = pc.z();
+          pts_curr.push_back(q);
+        }
+
+        aligned_frames.push_back(std::move(pts_curr));
+      }
+
+      if (icp_aligned_hist_pub_ && !concat_aligned_curr.empty()) {
         sensor_msgs::msg::PointCloud2 out;
         pcl::toROSMsg(concat_aligned_curr, out);
-        out.header = processed_scan->header; 
+        out.header = processed_scan->header;
         icp_aligned_hist_pub_->publish(out);
       }
 
-      std::vector<geometry_msgs::msg::Point> pts_curr;
-      pts_curr.reserve(obs_local_hist.size());
-      for (const auto &ps : obs_local_hist) {
-        Eigen::Vector4d pl(ps.point.x, ps.point.y, ps.point.z, 1.0);
-        Eigen::Vector4d pc = icp_pose.cast<double>() * pl;
-        geometry_msgs::msg::Point q; q.x = pc.x(); q.y = pc.y(); q.z = pc.z();
-        pts_curr.push_back(q);
-      }
-
-      aligned_frames.push_back(std::move(pts_curr));
+      detector_.publishAlignedFramesMarkers(
+        aligned_frames,
+        processed_scan->header.frame_id,
+        processed_scan->header.stamp,
+        aligned_history_markers_pub_,
+        0.06, 0.1
+      );
     }
-
-    detector_.publishAlignedFramesMarkers(
-      aligned_frames,
-      processed_scan->header.frame_id,
-      processed_scan->header.stamp,
-      aligned_history_markers_pub_,
-      0.06, 0.1
-    );
     
     // (4) update triplet
     {
@@ -523,12 +612,18 @@ private:
     enum Label { UNKNOWN=0, STATIC=1, DYNAMIC=2 };
     std::vector<Label> labels(centers.size(), UNKNOWN);
     for (size_t i = 0; i < centers.size(); ++i) {
+      
+      if(only_static_) {
+        labels[i] = STATIC;
+        continue;
+      }
+
       std::vector<geometry_msgs::msg::Point> footprint;
       double span = 0.0;
       const int dyn = detector_.classifyDynamicByFootprint(
         centers[i].point, aligned_frames,
-        /*eps=*/0.2, /*minPts=*/2, /*search_radius=*/0.4,
-        /*exclude_current=*/false, /*motion_thresh=*/0.2,
+        dyn_static_thresh_, dyn_min_history_frames_, dyn_match_gate_,
+        /*exclude_current=*/false, dyn_dynamic_thresh_,
         &footprint, &span);
 
       detector_.visualizeFootprint(
@@ -545,7 +640,7 @@ private:
       else if (lb == DYNAMIC)++num_dynamic;
       else                   ++num_unknown;
     }
-    RCLCPP_INFO(this->get_logger(),
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
                 "[CLF] centers=%zu  static=%d  dynamic=%d  unknown=%d",
                 centers.size(), num_static, num_dynamic, num_unknown);
 
@@ -841,6 +936,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr      current_scan_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr      icp_aligned_hist_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr icp_frames_markers_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr wall_pub_;
 
   // subs (ExactTime 3-way)
   std::string processed_scan_topic_{"/processed_scan"};
@@ -859,6 +955,13 @@ private:
   int    dbscan_min_points_{1};
   int    min_candidates_to_process_{1};
   bool   use_weighted_median_{false};
+  bool   only_static_{false};
+
+  // params (dynamic/static classification)
+  double dyn_match_gate_{0.6};
+  int    dyn_min_history_frames_{3};
+  double dyn_static_thresh_{0.10};
+  double dyn_dynamic_thresh_{0.30};
 
   // SINGLE manager
   MapManager map_manager_;
