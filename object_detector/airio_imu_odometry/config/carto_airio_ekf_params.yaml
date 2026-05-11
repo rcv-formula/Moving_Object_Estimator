@@ -1,0 +1,39 @@
+carto_airio_ekf_node:
+  ros__parameters:
+    imu_topic: /imu/data
+    airimu_topic: /airimu_imu_data
+    odom_carto_topic: /odom
+    odom_airio_topic: /odom_airio
+    odom_pub_topic: /odom_fused
+    odom_pub_rate: 50.0
+
+    # IMU가 이미 중력 보정이라면 False
+    imu_has_gravity: false
+
+    # Carto 신뢰 ↑
+    use_carto_cov_from_msg: false
+    default_pos_std_m: [0.15, 0.15, 0.50]
+    default_rpy_std_deg: [1.5, 1.5, 1.5]
+    chi2_thresh: 50.0
+    skip_thresh: -1.0
+    warmup_sec: 0.5
+    boot_skip: 0
+
+    # IMU 끊김 대응
+    imu_timeout_sec: 0.25
+    md_q_scale: 150.0
+
+    # AirIO 속도 업데이트
+    use_body_vel_update: false
+    vel_deadband_mmps: 5.0
+    vel_std_body_mps: [0.15, 0.15, 0.30]
+
+    # 2D 운용
+    use_2d_mode: true
+
+    # 급작 이동 대응
+    pos_reset_thresh_m: 1.2
+    yaw_reset_thresh_deg: 25.0
+    nis_reset_thresh: 400.0
+    snap_beta: 0.5
+    vel_damping_on_reset: 0.7

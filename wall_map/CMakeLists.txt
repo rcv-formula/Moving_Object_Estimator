@@ -7,6 +7,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
@@ -18,6 +19,7 @@ add_library(wall_map_lib
 
 ament_target_dependencies(wall_map_lib
   ament_index_cpp
+  geometry_msgs
   nav_msgs
 )
 
@@ -40,8 +42,12 @@ install(DIRECTORY maps
   DESTINATION share/${PROJECT_NAME}
 )
 
+install(DIRECTORY config
+  DESTINATION share/${PROJECT_NAME}
+)
+
 ament_export_include_directories(include)
 ament_export_libraries(wall_map_lib)
-ament_export_dependencies(ament_index_cpp nav_msgs yaml-cpp)
+ament_export_dependencies(ament_index_cpp geometry_msgs nav_msgs yaml-cpp)
 
 ament_package()

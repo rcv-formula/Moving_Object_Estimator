@@ -6,7 +6,12 @@ using wall_map::StaticWallMap;
 
 StaticWallMap wall_map;
 
-if (!wall_map.load_from_yaml(map_yaml_path)) {
+if (!wall_map.load_from_yaml("0120.yaml")) {
+    return;
+}
+
+// 또는 설치된 config/config.yaml 사용
+if (!wall_map.load_from_config("config.yaml")) {
     return;
 }
 

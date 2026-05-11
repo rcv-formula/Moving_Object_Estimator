@@ -5,10 +5,64 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <fstream>
 
 namespace wall_map
 {
+namespace
+{
+
+bool file_exists(const std::string & path)
+{
+  std::ifstream input(path, std::ios::binary);
+  return input.good();
+}
+
+bool is_absolute_path(const std::string & path)
+{
+  return !path.empty() && path.front() == '/';
+}
+
+std::string directory_name(const std::string & path)
+{
+  const auto pos = path.find_last_of("/\\");
+  if (pos == std::string::npos) {
+    return ".";
+  }
+
+  return path.substr(0, pos);
+}
+
+std::string resolve_package_file(
+  const std::string & subdirectory, const std::string & path)
+{
+  if (is_absolute_path(path) || file_exists(path)) {
+    return path;
+  }
+
+  const std::string package_share_dir = ament_index_cpp::get_package_share_directory("wall_map");
+  const std::string share_relative_path = package_share_dir + "/" + path;
+  if (file_exists(share_relative_path)) {
+    return share_relative_path;
+  }
+
+  return package_share_dir + "/" + subdirectory + "/" + path;
+}
+
+bool read_pgm_token(std::istream & input, std::string & token)
+{
+  input >> std::ws;
+  while (input.peek() == '#') {
+    std::string ignored;
+    std::getline(input, ignored);
+    input >> std::ws;
+  }
+
+  return static_cast<bool>(input >> token);
+}
+
+}  // namespace
 
 StaticWallMap::StaticWallMap(bool unknown_occupied_in, int occupied_threshold_in)
 : unknown_occupied(unknown_occupied_in),
@@ -29,22 +83,29 @@ bool StaticWallMap::load_from_yaml(const std::string & yaml_path)
 
 bool StaticWallMap::load_from_config(const std::string & config_path)
 {
-  const std::string resolved_config_path = resolve_yaml_path(config_path);
-  
+  const std::string resolved_config_path = resolve_config_path(config_path);
+
   try {
     YAML::Node config = YAML::LoadFile(resolved_config_path);
-    
+
     if (!config["map_file"]) {
       return false;
     }
-    
+
     std::string map_file = config["map_file"].as<std::string>();
-    
-    // Resolve map file path relative to config file location
-    const std::string config_dir = resolved_config_path.substr(0, resolved_config_path.find_last_of("/\\"));
-    std::string full_map_path = config_dir + "/" + map_file;
-    
-    return load_from_yaml(full_map_path);
+
+    if (is_absolute_path(map_file)) {
+      return load_from_yaml(map_file);
+    }
+
+    // Prefer config-relative paths, then fall back to package maps.
+    const std::string config_dir = directory_name(resolved_config_path);
+    const std::string config_relative_map_path = config_dir + "/" + map_file;
+    if (file_exists(config_relative_map_path)) {
+      return load_from_yaml(config_relative_map_path);
+    }
+
+    return load_from_yaml(map_file);
   } catch (const std::exception &) {
     return false;
   }
@@ -126,31 +187,43 @@ bool StaticWallMap::is_wall_value(int8_t value) const
 
 bool StaticWallMap::parse_yaml(const std::string & yaml_path, map_yaml & out)
 {
-  YAML::Node doc = YAML::LoadFile(yaml_path);
+  YAML::Node doc;
+  try {
+    doc = YAML::LoadFile(yaml_path);
+  } catch (const std::exception &) {
+    return false;
+  }
 
   if (!doc["image"] || !doc["resolution"] || !doc["origin"]) {
     return false;
   }
 
-  out.image = doc["image"].as<std::string>();
-  out.resolution = doc["resolution"].as<double>();
+  try {
+    out.image = doc["image"].as<std::string>();
+    out.resolution = doc["resolution"].as<double>();
 
-  const auto origin = doc["origin"];
-  out.origin_x = origin[0].as<double>();
-  out.origin_y = origin[1].as<double>();
-  out.origin_yaw = origin[2].as<double>();
+    const auto origin = doc["origin"];
+    if (!origin.IsSequence() || origin.size() < 3) {
+      return false;
+    }
+    out.origin_x = origin[0].as<double>();
+    out.origin_y = origin[1].as<double>();
+    out.origin_yaw = origin[2].as<double>();
 
-  if (doc["negate"]) {
-    out.negate = doc["negate"].as<int>();
-  }
-  if (doc["occupied_thresh"]) {
-    out.occupied_thresh = doc["occupied_thresh"].as<double>();
-  }
-  if (doc["free_thresh"]) {
-    out.free_thresh = doc["free_thresh"].as<double>();
+    if (doc["negate"]) {
+      out.negate = doc["negate"].as<int>();
+    }
+    if (doc["occupied_thresh"]) {
+      out.occupied_thresh = doc["occupied_thresh"].as<double>();
+    }
+    if (doc["free_thresh"]) {
+      out.free_thresh = doc["free_thresh"].as<double>();
+    }
+  } catch (const std::exception &) {
+    return false;
   }
 
-  return true;
+  return out.resolution > 0.0;
 }
 
 bool StaticWallMap::read_pgm(
@@ -162,29 +235,34 @@ bool StaticWallMap::read_pgm(
   }
 
   std::string magic;
-  input >> magic;
+  if (!read_pgm_token(input, magic)) {
+    return false;
+  }
   if (magic != "P5" && magic != "P2") {
     return false;
   }
 
-  auto skip_comments = [&input]() {
-    while (input.peek() == '#') {
-      std::string line;
-      std::getline(input, line);
-    }
-  };
-
-  skip_comments();
-  input >> width_out;
-  skip_comments();
-  input >> height_out;
-  skip_comments();
+  std::string width_token;
+  std::string height_token;
+  std::string max_value_token;
+  if (!read_pgm_token(input, width_token) ||
+    !read_pgm_token(input, height_token) ||
+    !read_pgm_token(input, max_value_token))
+  {
+    return false;
+  }
 
   int max_value = 0;
-  input >> max_value;
+  try {
+    width_out = std::stoi(width_token);
+    height_out = std::stoi(height_token);
+    max_value = std::stoi(max_value_token);
+  } catch (const std::exception &) {
+    return false;
+  }
   input.get();
 
-  if (width_out <= 0 || height_out <= 0) {
+  if (width_out <= 0 || height_out <= 0 || max_value <= 0 || max_value > 255) {
     return false;
   }
 
@@ -201,7 +279,7 @@ bool StaticWallMap::read_pgm(
     if (!input.good()) {
       return false;
     }
-    pixels[i] = static_cast<uint8_t>(std::clamp(value, 0, 255));
+    pixels[i] = static_cast<uint8_t>(std::clamp(value * 255 / max_value, 0, 255));
   }
 
   return true;
@@ -224,12 +302,12 @@ std::string StaticWallMap::resolve_image_path(
 
 std::string StaticWallMap::resolve_yaml_path(const std::string & yaml_path)
 {
-  if (!yaml_path.empty() && yaml_path.front() == '/') {
-    return yaml_path;
-  }
+  return resolve_package_file("maps", yaml_path);
+}
 
-  const std::string package_share_dir = ament_index_cpp::get_package_share_directory("wall_map");
-  return package_share_dir + "/maps/" + yaml_path;
+std::string StaticWallMap::resolve_config_path(const std::string & config_path)
+{
+  return resolve_package_file("config", config_path);
 }
 
 double StaticWallMap::yaw_from_quaternion(const geometry_msgs::msg::Quaternion & q)

@@ -11,8 +11,10 @@
 //          /icp_frames_markers (visualization_msgs::MarkerArray)
 
 #include <rclcpp/rclcpp.hpp>
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/color_rgba.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 
@@ -130,22 +132,41 @@ public:
     this->declare_parameter<double>("kf_gate_dist", 0.4);          // [m] gating
     this->declare_parameter<double>("kf_reset_timeout_sec", 0.20);  // [s] ≈ 2 frames at 20Hz
 
-    this->declare_parameter<std::string>("track_csv_path", "/home/rcv/Desktop/object_detector/track/1103_track.csv");
+    const std::string default_track_csv_path =
+      ament_index_cpp::get_package_share_directory("object_detector") + "/track/0120_track.csv";
+    this->declare_parameter<std::string>("track_csv_path", default_track_csv_path);
     this->declare_parameter<bool>("track_csv_has_header", true);
     this->declare_parameter<bool>("only_static", true);
 
-    // ===== Parameters (static wall map filtering) =====
+    // ===== Parameters (static wall-map filtering) =====
     this->declare_parameter<bool>("wall_map.enable", true);
+    this->declare_parameter<bool>("wall_map.use_config", true);
+    this->declare_parameter<std::string>("wall_map.config_path", "config.yaml");
     this->declare_parameter<std::string>("wall_map.yaml_path", "0120.yaml");
     this->declare_parameter<bool>("wall_map.unknown_occupied", true);
     this->declare_parameter<int>("wall_map.occupied_threshold", 50);
-    this->declare_parameter<double>("wall_map.filter_radius", 0.10);
+    this->declare_parameter<bool>("wall_map.reject_out_of_map", false);
 
     // ===== Parameters (dynamic/static classification) =====
     this->declare_parameter<double>("dynamic_classification.match_gate", 0.6);
-    this->declare_parameter<int>("dynamic_classification.min_history_frames", 3);
+    this->declare_parameter<int>("dynamic_classification.min_history_frames", 2);
     this->declare_parameter<double>("dynamic_classification.static_thresh", 0.10);
     this->declare_parameter<double>("dynamic_classification.dynamic_thresh", 0.30);
+    this->declare_parameter<double>("dynamic_classification.unknown_hold_sec", 1.2);
+    this->declare_parameter<double>("dynamic_classification.unknown_hold_gate", 0.8);
+    this->declare_parameter<bool>("dynamic_classification.smoothing_enable", true);
+    this->declare_parameter<double>("dynamic_classification.smoothing_gate", 0.7);
+    this->declare_parameter<double>("dynamic_classification.smoothing_max_age_sec", 1.0);
+    this->declare_parameter<double>("dynamic_classification.static_memory_max_age_sec", 60.0);
+    this->declare_parameter<int>("dynamic_classification.dynamic_confirm_frames", 2);
+    this->declare_parameter<int>("dynamic_classification.static_confirm_frames", 2);
+    this->declare_parameter<bool>("dynamic_classification.use_icp_aligned_history", false);
+    this->declare_parameter<int>("dynamic_classification.static_to_dynamic_confirm_frames", 8);
+    this->declare_parameter<double>("dynamic_classification.static_lock_break_dist", 0.35);
+
+    // ===== Parameters (planner bridge) =====
+    this->declare_parameter<int>("planner_bridge.static_confirm_frames", 2);
+    this->declare_parameter<int>("planner_bridge.dynamic_confirm_frames", 2);
 
     // ===== Load Parameters =====
     this->get_parameter("dbscan_eps", dbscan_eps_);
@@ -184,16 +205,34 @@ public:
     this->get_parameter("track_csv_has_header", track_csv_has_header_);
     this->get_parameter("only_static", only_static_);
 
-    this->get_parameter("wall_map.enable", wall_map_enable_);
+    this->get_parameter("wall_map.enable", wall_map_enabled_);
+    this->get_parameter("wall_map.use_config", wall_map_use_config_);
+    this->get_parameter("wall_map.config_path", wall_map_config_path_);
     this->get_parameter("wall_map.yaml_path", wall_map_yaml_path_);
     this->get_parameter("wall_map.unknown_occupied", wall_map_unknown_occupied_);
     this->get_parameter("wall_map.occupied_threshold", wall_map_occupied_threshold_);
-    this->get_parameter("wall_map.filter_radius", wall_map_filter_radius_);
+    this->get_parameter("wall_map.reject_out_of_map", wall_map_reject_out_of_map_);
 
     this->get_parameter("dynamic_classification.match_gate", dyn_match_gate_);
     this->get_parameter("dynamic_classification.min_history_frames", dyn_min_history_frames_);
     this->get_parameter("dynamic_classification.static_thresh", dyn_static_thresh_);
     this->get_parameter("dynamic_classification.dynamic_thresh", dyn_dynamic_thresh_);
+    this->get_parameter("dynamic_classification.unknown_hold_sec", dyn_unknown_hold_sec_);
+    this->get_parameter("dynamic_classification.unknown_hold_gate", dyn_unknown_hold_gate_);
+    this->get_parameter("dynamic_classification.smoothing_enable", dyn_smoothing_enable_);
+    this->get_parameter("dynamic_classification.smoothing_gate", dyn_smoothing_gate_);
+    this->get_parameter("dynamic_classification.smoothing_max_age_sec", dyn_smoothing_max_age_sec_);
+    this->get_parameter("dynamic_classification.static_memory_max_age_sec", dyn_static_memory_max_age_sec_);
+    this->get_parameter("dynamic_classification.dynamic_confirm_frames", dyn_dynamic_confirm_frames_);
+    this->get_parameter("dynamic_classification.static_confirm_frames", dyn_static_confirm_frames_);
+    this->get_parameter("dynamic_classification.use_icp_aligned_history", dyn_use_icp_aligned_history_);
+    this->get_parameter("dynamic_classification.static_to_dynamic_confirm_frames", dyn_static_to_dynamic_confirm_frames_);
+    this->get_parameter("dynamic_classification.static_lock_break_dist", dyn_static_lock_break_dist_);
+    this->get_parameter("planner_bridge.static_confirm_frames", obj_flag_static_confirm_frames_);
+    this->get_parameter("planner_bridge.dynamic_confirm_frames", obj_flag_dynamic_confirm_frames_);
+
+    map_manager_.set_max_deque_size(
+      std::max<std::size_t>(10, static_cast<std::size_t>(std::max(1, icp_max_history_))));
 
     // ===== ICP Refiner init =====
     {
@@ -211,24 +250,12 @@ public:
     }
 
     detector_.loadTrackCsvPCL(track_csv_path_, track_csv_has_header_);
-    if (wall_map_enable_) {
-      wall_map_ = std::make_unique<wall_map::StaticWallMap>(
-        wall_map_unknown_occupied_, wall_map_occupied_threshold_);
-      wall_map_loaded_ = wall_map_->load_from_yaml(wall_map_yaml_path_);
-      if (wall_map_loaded_) {
-        RCLCPP_INFO(
-          this->get_logger(), "Loaded static wall map: %s", wall_map_yaml_path_.c_str());
-      } else {
-        RCLCPP_WARN(
-          this->get_logger(),
-          "Failed to load static wall map '%s'. Wall-map filtering is disabled.",
-          wall_map_yaml_path_.c_str());
-      }
-    }
+    initializeWallMapFilter();
 
     // ===== Publishers =====
     static_pub_     = this->create_publisher<geometry_msgs::msg::PointStamped>("/static_obstacle", 10);
     dynamic_pub_    = this->create_publisher<nav_msgs::msg::Odometry>(dynamic_odom_topic_, 20);
+    obj_flag_pub_   = this->create_publisher<geometry_msgs::msg::PointStamped>("/obj_flag", 10);
     dbscan_vis_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/dbscan_clusters", 10);
     aligned_history_markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/aligned_obj_history", 10);
     current_scan_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/current_scan_pcl", 10);
@@ -237,7 +264,7 @@ public:
     wall_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("/track_wall_marker", 1);
 
     // ===== Detection node check =====
-    RCLCPP_INFO(this->get_logger(), "ObstacleDetector node mode:: %s", only_static_ ? "ONLY STATIC":"DYNAMIC+STATIC");
+    RCLCPP_DEBUG(this->get_logger(), "ObstacleDetector node mode:: %s", only_static_ ? "ONLY STATIC":"DYNAMIC+STATIC");
 
     // ===== ExactTime 3-way sync =====
     proc_scan_sub_.subscribe(this, processed_scan_topic_.c_str(), rmw_qos_profile_sensor_data);
@@ -323,59 +350,6 @@ private:
     out.point.y = pw.y();
     out.point.z = pw.z();
     return out;
-  }
-
-  bool isWallMapOccupiedNear(double x, double y) const
-  {
-    if (!wall_map_enable_ || !wall_map_loaded_ || !wall_map_) {
-      return false;
-    }
-
-    const auto center_wall = wall_map_->is_wall_at(x, y);
-    if (center_wall.has_value() && center_wall.value()) {
-      return true;
-    }
-
-    const double radius = std::max(0.0, wall_map_filter_radius_);
-    if (radius <= 1e-6) {
-      return false;
-    }
-
-    const auto & map = wall_map_->map();
-    const double resolution = static_cast<double>(map.info.resolution);
-    const double step = std::max(0.02, resolution > 0.0 ? resolution : 0.05);
-
-    for (double dx = -radius; dx <= radius + 1e-9; dx += step) {
-      for (double dy = -radius; dy <= radius + 1e-9; dy += step) {
-        if ((dx * dx + dy * dy) > radius * radius) {
-          continue;
-        }
-
-        const auto is_wall = wall_map_->is_wall_at(x + dx, y + dy);
-        if (is_wall.has_value() && is_wall.value()) {
-          return true;
-        }
-      }
-    }
-
-    return false;
-  }
-
-  bool acceptObstacleCandidate(const geometry_msgs::msg::Point& obstacle_in_map) const
-  {
-    if (!detector_.isObstacleWithinWallPCL(obstacle_in_map)) {
-      return false;
-    }
-
-    if (isWallMapOccupiedNear(obstacle_in_map.x, obstacle_in_map.y)) {
-      RCLCPP_DEBUG(
-        this->get_logger(),
-        "[WallMapFilter] Reject obstacle at map=(%.3f, %.3f) as static wall.",
-        obstacle_in_map.x, obstacle_in_map.y);
-      return false;
-    }
-
-    return true;
   }
 
   static inline void hsvToRgb(double h, double s, double v,
@@ -590,6 +564,8 @@ private:
     auto clusters = performDBSCAN(frame_points);
     std::vector<geometry_msgs::msg::PointStamped> centers;
     centers.reserve(std::max<size_t>(1, clusters.size()));
+    std::vector<std::vector<size_t>> center_clusters;
+    center_clusters.reserve(std::max<size_t>(1, clusters.size()));
 
     if (!clusters.empty()) {
       for (const auto &c : clusters) {
@@ -600,17 +576,20 @@ private:
 
         const auto p_world = transformLocalWithPose(p, pose_used);
         geometry_msgs::msg::Point obs = p_world.point;
-        if (acceptObstacleCandidate(obs)) {
+        if (isValidObstacleInMap(obs)) {
           // 유효(벽 안쪽) → centers에 push_back
           centers.push_back(p);
+          center_clusters.push_back(c);
         }
       }
     } else {
-      for (const auto &pt : frame_points) {
+      for (size_t idx = 0; idx < frame_points.size(); ++idx) {
+        const auto &pt = frame_points[idx];
         const auto p_world = transformLocalWithPose(pt, pose_used);
         geometry_msgs::msg::Point obs = p_world.point;
-        if (acceptObstacleCandidate(obs)) {
+        if (isValidObstacleInMap(obs)) {
           centers.push_back(pt);
+          center_clusters.push_back({idx});
         }
       }
     }
@@ -640,26 +619,46 @@ private:
         const Eigen::Matrix4d T_world_hist = poseToT(pose_hist);
         const Eigen::Matrix4d T_curr_hist  = T_curr_world * T_world_hist;
 
-        Eigen::Matrix4f icp_pose = T_curr_hist.cast<float>();
+        const Eigen::Matrix4f odom_pose = T_curr_hist.cast<float>();
+        Eigen::Matrix4f icp_pose = odom_pose;
+        Eigen::Matrix4f obstacle_history_pose = odom_pose;
         double fitness = 0.0;
-        if (icp_enable_) {
+        const bool need_icp = icp_enable_ && (icp_viz_enable_ || dyn_use_icp_aligned_history_);
+        if (need_icp) {
           fitness = std::numeric_limits<double>::infinity();
-          icp_pose = icp_refiner_->refine(
+          const Eigen::Matrix4f refined_pose = icp_refiner_->refine(
               /*target=*/scan_hist, /*source=*/curr,
-              T_curr_hist.cast<float>(), &fitness);
+              odom_pose, &fitness);
 
-          if(fitness > icp_gate_fitness_) continue;
+          const Eigen::Matrix4f correction = refined_pose * odom_pose.inverse();
+          const auto [dtrans, drot] = deltaRT(correction);
+          const bool accept_icp =
+            std::isfinite(fitness) &&
+            fitness <= icp_gate_fitness_ &&
+            dtrans <= icp_gate_dtrans_ &&
+            drot <= icp_gate_drot_;
+
+          if (accept_icp) {
+            icp_pose = refined_pose;
+            if (dyn_use_icp_aligned_history_) {
+              obstacle_history_pose = refined_pose;
+            }
+          } else {
+            icp_pose = odom_pose;
+          }
         }
 
-        Cloud aligned_in_curr;
-        pcl::transformPointCloud(*scan_hist, aligned_in_curr, icp_pose);
-        concat_aligned_curr += aligned_in_curr;
+        if (icp_viz_enable_) {
+          Cloud aligned_in_curr;
+          pcl::transformPointCloud(*scan_hist, aligned_in_curr, icp_pose);
+          concat_aligned_curr += aligned_in_curr;
+        }
 
         std::vector<geometry_msgs::msg::Point> pts_curr;
         pts_curr.reserve(obs_local_hist.size());
         for (const auto &ps : obs_local_hist) {
           Eigen::Vector4d pl(ps.point.x, ps.point.y, ps.point.z, 1.0);
-          Eigen::Vector4d pc = icp_pose.cast<double>() * pl;
+          Eigen::Vector4d pc = obstacle_history_pose.cast<double>() * pl;
           geometry_msgs::msg::Point q; q.x = pc.x(); q.y = pc.y(); q.z = pc.z();
           pts_curr.push_back(q);
         }
@@ -667,20 +666,22 @@ private:
         aligned_frames.push_back(std::move(pts_curr));
       }
 
-      if (icp_aligned_hist_pub_ && !concat_aligned_curr.empty()) {
+      if (icp_viz_enable_ && icp_aligned_hist_pub_ && !concat_aligned_curr.empty()) {
         sensor_msgs::msg::PointCloud2 out;
         pcl::toROSMsg(concat_aligned_curr, out);
         out.header = processed_scan->header;
         icp_aligned_hist_pub_->publish(out);
       }
 
-      detector_.publishAlignedFramesMarkers(
-        aligned_frames,
-        processed_scan->header.frame_id,
-        processed_scan->header.stamp,
-        aligned_history_markers_pub_,
-        0.06, 0.1
-      );
+      if (icp_viz_enable_) {
+        detector_.publishAlignedFramesMarkers(
+          aligned_frames,
+          processed_scan->header.frame_id,
+          processed_scan->header.stamp,
+          aligned_history_markers_pub_,
+          0.06, 0.1
+        );
+      }
     }
     
     // (4) update triplet
@@ -715,6 +716,244 @@ private:
       labels[i] = static_cast<Label>(dyn);
     }
 
+    if (!only_static_) {
+      const rclcpp::Time label_stamp(processed_scan->header.stamp);
+      const double hold_gate_sq = dyn_unknown_hold_gate_ * dyn_unknown_hold_gate_;
+      bool time_jumped_back = false;
+
+      dynamic_label_memory_.erase(
+        std::remove_if(
+          dynamic_label_memory_.begin(), dynamic_label_memory_.end(),
+          [&](const DynamicLabelMemory & memory) {
+            const double age = (label_stamp - memory.stamp).seconds();
+            if (age < -0.001) {
+              time_jumped_back = true;
+              return true;
+            }
+            return age > dyn_unknown_hold_sec_;
+          }),
+        dynamic_label_memory_.end());
+
+      if (time_jumped_back) {
+        dynamic_label_memory_.clear();
+      }
+
+      if (dyn_unknown_hold_sec_ > 0.0 && dyn_unknown_hold_gate_ > 0.0) {
+        for (size_t i = 0; i < centers.size(); ++i) {
+          if (labels[i] != UNKNOWN) continue;
+
+          const auto p_map = transformLocalWithPose(centers[i], pose_used);
+          for (const auto & memory : dynamic_label_memory_) {
+            const double dx = p_map.point.x - memory.point.x;
+            const double dy = p_map.point.y - memory.point.y;
+            if (dx * dx + dy * dy <= hold_gate_sq) {
+              labels[i] = DYNAMIC;
+              break;
+            }
+          }
+        }
+      }
+
+      if (dyn_smoothing_enable_ && dyn_smoothing_gate_ > 0.0) {
+        const double smooth_gate_sq = dyn_smoothing_gate_ * dyn_smoothing_gate_;
+
+        label_smoothing_memory_.erase(
+          std::remove_if(
+            label_smoothing_memory_.begin(), label_smoothing_memory_.end(),
+            [&](const LabelSmoothingMemory & memory) {
+              const double age = (label_stamp - memory.stamp).seconds();
+              const bool is_static = memory.label == static_cast<int>(STATIC);
+              const double max_age = is_static ?
+                std::max(dyn_smoothing_max_age_sec_, dyn_static_memory_max_age_sec_) :
+                dyn_smoothing_max_age_sec_;
+              return age < -0.001 || age > max_age;
+            }),
+          label_smoothing_memory_.end());
+
+        const auto find_static_anchor_idx =
+          [&](const geometry_msgs::msg::Point & point) -> size_t {
+            const double break_dist = std::max(0.0, dyn_static_lock_break_dist_);
+            if (break_dist <= 0.0) {
+              return label_smoothing_memory_.size();
+            }
+
+            const double break_dist_sq = break_dist * break_dist;
+            size_t best_idx = label_smoothing_memory_.size();
+            double best_d2 = break_dist_sq;
+            for (size_t j = 0; j < label_smoothing_memory_.size(); ++j) {
+              const auto & memory = label_smoothing_memory_[j];
+              if (memory.label != static_cast<int>(STATIC) || !memory.has_static_anchor) {
+                continue;
+              }
+
+              const double dx = point.x - memory.static_anchor.x;
+              const double dy = point.y - memory.static_anchor.y;
+              const double d2 = dx * dx + dy * dy;
+              if (d2 <= best_d2) {
+                best_d2 = d2;
+                best_idx = j;
+              }
+            }
+            return best_idx;
+          };
+
+        std::vector<bool> matched(label_smoothing_memory_.size(), false);
+        for (size_t i = 0; i < centers.size(); ++i) {
+          const auto p_map = transformLocalWithPose(centers[i], pose_used);
+          Label raw_label = labels[i];
+          const size_t locked_static_idx =
+            (raw_label == DYNAMIC) ? find_static_anchor_idx(p_map.point) : label_smoothing_memory_.size();
+          const bool locked_by_static_anchor =
+            locked_static_idx != label_smoothing_memory_.size();
+          if (locked_by_static_anchor) {
+            raw_label = STATIC;
+          }
+
+          size_t best_idx = label_smoothing_memory_.size();
+          double best_d2 = smooth_gate_sq;
+          for (size_t j = 0; j < label_smoothing_memory_.size(); ++j) {
+            if (matched[j]) continue;
+            const double dx = p_map.point.x - label_smoothing_memory_[j].point.x;
+            const double dy = p_map.point.y - label_smoothing_memory_[j].point.y;
+            double d2 = dx * dx + dy * dy;
+            const auto & memory = label_smoothing_memory_[j];
+            if (memory.label == static_cast<int>(STATIC) && memory.has_static_anchor) {
+              const double adx = p_map.point.x - memory.static_anchor.x;
+              const double ady = p_map.point.y - memory.static_anchor.y;
+              d2 = std::min(d2, adx * adx + ady * ady);
+            }
+            if (d2 <= best_d2) {
+              best_d2 = d2;
+              best_idx = j;
+            }
+          }
+
+          if (best_idx == label_smoothing_memory_.size()) {
+            LabelSmoothingMemory memory;
+            memory.point = p_map.point;
+            memory.stamp = label_stamp;
+            memory.label = (raw_label == DYNAMIC) ? static_cast<int>(DYNAMIC) :
+              (locked_by_static_anchor ? static_cast<int>(STATIC) : static_cast<int>(UNKNOWN));
+            memory.pending_label = (raw_label == UNKNOWN) ? static_cast<int>(UNKNOWN) : static_cast<int>(raw_label);
+            memory.pending_count = (raw_label == UNKNOWN) ? 0 : 1;
+            if (locked_by_static_anchor) {
+              memory.static_anchor = label_smoothing_memory_[locked_static_idx].static_anchor;
+              memory.has_static_anchor = true;
+            } else if (memory.label == static_cast<int>(STATIC)) {
+              memory.static_anchor = p_map.point;
+              memory.has_static_anchor = true;
+            }
+            label_smoothing_memory_.push_back(memory);
+            matched.push_back(true);
+            labels[i] = static_cast<Label>(memory.label);
+            continue;
+          }
+
+          auto & memory = label_smoothing_memory_[best_idx];
+          matched[best_idx] = true;
+
+          if (locked_by_static_anchor) {
+            memory.label = static_cast<int>(STATIC);
+            memory.static_anchor = label_smoothing_memory_[locked_static_idx].static_anchor;
+            memory.has_static_anchor = true;
+            memory.pending_label = static_cast<int>(UNKNOWN);
+            memory.pending_count = 0;
+            labels[i] = STATIC;
+            memory.point = p_map.point;
+            memory.stamp = label_stamp;
+            continue;
+          }
+
+          if (memory.label == static_cast<int>(STATIC) && raw_label == DYNAMIC) {
+            if (!memory.has_static_anchor) {
+              memory.static_anchor = memory.point;
+              memory.has_static_anchor = true;
+            }
+            const double dx = p_map.point.x - memory.static_anchor.x;
+            const double dy = p_map.point.y - memory.static_anchor.y;
+            const double break_dist = std::max(0.0, dyn_static_lock_break_dist_);
+            if (dx * dx + dy * dy <= break_dist * break_dist) {
+              labels[i] = STATIC;
+              memory.point = p_map.point;
+              memory.stamp = label_stamp;
+              memory.pending_label = static_cast<int>(UNKNOWN);
+              memory.pending_count = 0;
+              continue;
+              }
+          }
+
+          if (raw_label != UNKNOWN && raw_label != static_cast<Label>(memory.label)) {
+            if (memory.pending_label == static_cast<int>(raw_label)) {
+              ++memory.pending_count;
+            } else {
+              memory.pending_label = static_cast<int>(raw_label);
+              memory.pending_count = 1;
+            }
+
+            int confirm_frames = (raw_label == DYNAMIC) ?
+              std::max(1, dyn_dynamic_confirm_frames_) :
+              std::max(1, dyn_static_confirm_frames_);
+            if (memory.label == static_cast<int>(STATIC) && raw_label == DYNAMIC) {
+              confirm_frames = std::max(confirm_frames, dyn_static_to_dynamic_confirm_frames_);
+            }
+            if (memory.pending_count >= confirm_frames) {
+              memory.label = static_cast<int>(raw_label);
+              memory.pending_label = static_cast<int>(UNKNOWN);
+              memory.pending_count = 0;
+              if (raw_label == STATIC) {
+                memory.static_anchor = p_map.point;
+                memory.has_static_anchor = true;
+              } else if (raw_label == DYNAMIC) {
+                memory.has_static_anchor = false;
+              }
+            }
+          } else if (raw_label != UNKNOWN) {
+            memory.label = static_cast<int>(raw_label);
+            memory.pending_label = static_cast<int>(UNKNOWN);
+            memory.pending_count = 0;
+            if (raw_label == STATIC) {
+              if (!memory.has_static_anchor) {
+                memory.static_anchor = p_map.point;
+                memory.has_static_anchor = true;
+              }
+            } else if (raw_label == DYNAMIC) {
+              memory.has_static_anchor = false;
+            }
+          }
+
+          labels[i] = static_cast<Label>(memory.label);
+          memory.point = p_map.point;
+          memory.stamp = label_stamp;
+        }
+
+        constexpr size_t kMaxLabelSmoothingMemory = 200;
+        if (label_smoothing_memory_.size() > kMaxLabelSmoothingMemory) {
+          label_smoothing_memory_.erase(
+            label_smoothing_memory_.begin(),
+            label_smoothing_memory_.begin() +
+              static_cast<std::ptrdiff_t>(label_smoothing_memory_.size() - kMaxLabelSmoothingMemory));
+        }
+      }
+
+      for (size_t i = 0; i < centers.size(); ++i) {
+        if (labels[i] != DYNAMIC) continue;
+
+        const auto p_map = transformLocalWithPose(centers[i], pose_used);
+        DynamicLabelMemory memory;
+        memory.point = p_map.point;
+        memory.stamp = label_stamp;
+        dynamic_label_memory_.push_back(memory);
+      }
+
+      constexpr size_t kMaxDynamicLabelMemory = 200;
+      if (dynamic_label_memory_.size() > kMaxDynamicLabelMemory) {
+        dynamic_label_memory_.erase(
+          dynamic_label_memory_.begin(),
+          dynamic_label_memory_.begin() +
+            static_cast<std::ptrdiff_t>(dynamic_label_memory_.size() - kMaxDynamicLabelMemory));
+      }
+    }
+
     int num_static = 0, num_dynamic = 0, num_unknown = 0;
     for (auto lb : labels) {
       if (lb == STATIC)      ++num_static;
@@ -722,8 +961,37 @@ private:
       else                   ++num_unknown;
     }
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "[CLF] centers=%zu  static=%d  dynamic=%d  unknown=%d",
+                "[OBSTACLE_STATUS] centers=%zu  static=%d  dynamic=%d  unknown=%d",
                 centers.size(), num_static, num_dynamic, num_unknown);
+
+    const int static_confirm_frames = std::max(1, obj_flag_static_confirm_frames_);
+    const int dynamic_confirm_frames = std::max(1, obj_flag_dynamic_confirm_frames_);
+    obj_flag_static_count_ = (num_static > 0) ?
+      std::min(obj_flag_static_count_ + 1, static_confirm_frames) : 0;
+    obj_flag_dynamic_count_ = (num_dynamic > 0) ?
+      std::min(obj_flag_dynamic_count_ + 1, dynamic_confirm_frames) : 0;
+
+    const bool confirmed_static = obj_flag_static_count_ >= static_confirm_frames;
+    const bool confirmed_dynamic = obj_flag_dynamic_count_ >= dynamic_confirm_frames;
+
+    std::vector<Label> output_labels = labels;
+    for (auto & label : output_labels) {
+      if (label == STATIC && !confirmed_static) {
+        label = UNKNOWN;
+      } else if (label == DYNAMIC && !confirmed_dynamic) {
+        label = UNKNOWN;
+      }
+    }
+
+    {
+      geometry_msgs::msg::PointStamped flag_msg;
+      flag_msg.header.stamp = processed_scan->header.stamp;
+      flag_msg.header.frame_id = "map";
+      flag_msg.point.x = confirmed_dynamic ? 1.0 : 0.0;
+      flag_msg.point.y = confirmed_static ? 1.0 : 0.0;
+      flag_msg.point.z = confirmed_static ? 2.0 : (confirmed_dynamic ? 1.0 : 0.0);
+      obj_flag_pub_->publish(flag_msg);
+    }
 
     // (6) DBSCAN viz
     {
@@ -736,18 +1004,27 @@ private:
       const std::string frame_id = processed_scan->header.frame_id;
       const auto stamp = processed_scan->header.stamp;
 
-      for (size_t i=0; i<clusters.size(); ++i) {
+      auto set_label_color = [](std_msgs::msg::ColorRGBA & color, Label label, float alpha) {
+        if (label == DYNAMIC) {
+          color.r = 1.0f; color.g = 0.0f; color.b = 0.0f; color.a = alpha;
+        } else if (label == STATIC) {
+          color.r = 0.1f; color.g = 0.4f; color.b = 1.0f; color.a = alpha;
+        } else {
+          color.r = 0.4f; color.g = 0.4f; color.b = 0.4f; color.a = alpha;
+        }
+      };
+
+      for (size_t i=0; i<center_clusters.size() && i<labels.size(); ++i) {
         visualization_msgs::msg::Marker pts;
         pts.header.frame_id = frame_id; pts.header.stamp = stamp;
         pts.ns = "dbscan_points"; pts.id = static_cast<int>(i);
         pts.type = visualization_msgs::msg::Marker::SPHERE_LIST;
         pts.action = visualization_msgs::msg::Marker::ADD;
         pts.scale.x = 0.06; pts.scale.y = 0.06; pts.scale.z = 0.06;
+        set_label_color(pts.color, output_labels[i], 0.9f);
 
-        float r=1,g=1,b=1; hsvToRgb((i % 12) / 12.0, 0.9, 0.95, r, g, b);
-        pts.color.r = r; pts.color.g = g; pts.color.b = b; pts.color.a = 0.9f;
-
-        for (auto idx : clusters[i]) {
+        for (auto idx : center_clusters[i]) {
+          if (idx >= frame_points.size()) continue;
           geometry_msgs::msg::Point p; p.x = frame_points[idx].point.x; p.y = frame_points[idx].point.y; p.z = 0.0;
           pts.points.push_back(p);
         }
@@ -764,9 +1041,7 @@ private:
         c.pose.position = centers[i].point;
         c.scale.x = 0.15; c.scale.y = 0.15; c.scale.z = 0.15;
 
-        if (labels[i] == DYNAMIC)       { c.color.r = 1.0f; c.color.g = 0.1f; c.color.b = 0.1f; c.color.a = 0.95f; }
-        else if (labels[i] == STATIC) { c.color.r = 0.1f; c.color.g = 0.4f; c.color.b = 1.0f; c.color.a = 0.95f; }
-        else { c.color.r = 0.4f; c.color.g = 0.4f; c.color.b = 0.4f; c.color.a = 0.95f; }
+        set_label_color(c.color, output_labels[i], 0.95f);
         c.lifetime = rclcpp::Duration::from_seconds(0.2);
         marr.markers.push_back(c);
       }
@@ -849,7 +1124,7 @@ private:
 
         if (!was_init && kalman_initialized_) {
           publishDynamicOdom(stamp);
-          RCLCPP_INFO(this->get_logger(), "KF initialized at (%.2f, %.2f).", kf_state_[0], kf_state_[1]);
+          RCLCPP_DEBUG(this->get_logger(), "KF initialized at (%.2f, %.2f).", kf_state_[0], kf_state_[1]);
         }
       } else {
         // 이번 프레임에서 측정 업데이트가 없었음 → 미검출 처리(타임아웃 시 reset)
@@ -857,7 +1132,7 @@ private:
           ++kf_miss_count_;
           const double dt_since_update = (stamp - last_kf_update_time_).seconds();
           if (dt_since_update >= kf_reset_timeout_sec_) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
               "KF reset by timeout: no update for %.0f ms (>= %.0f ms).",
               1000.0*dt_since_update, 1000.0*kf_reset_timeout_sec_);
             kfReset();
@@ -1008,10 +1283,62 @@ private:
     dynamic_pub_->publish(odom);
   }
 
+  void initializeWallMapFilter()
+  {
+    if (!wall_map_enabled_) {
+      return;
+    }
+
+    static_wall_map_ =
+      wall_map::StaticWallMap(wall_map_unknown_occupied_, wall_map_occupied_threshold_);
+
+    const bool loaded = wall_map_use_config_ ?
+      static_wall_map_.load_from_config(wall_map_config_path_) :
+      static_wall_map_.load_from_yaml(wall_map_yaml_path_);
+
+    if (!loaded) {
+      wall_map_enabled_ = false;
+      RCLCPP_DEBUG(
+        this->get_logger(),
+        "wall_map filter disabled: failed to load %s '%s'",
+        wall_map_use_config_ ? "config" : "yaml",
+        wall_map_use_config_ ? wall_map_config_path_.c_str() : wall_map_yaml_path_.c_str());
+      return;
+    }
+
+    const auto & map = static_wall_map_.map();
+    RCLCPP_DEBUG(
+      this->get_logger(),
+      "wall_map filter enabled: %ux%u resolution=%.3f source=%s",
+      map.info.width,
+      map.info.height,
+      map.info.resolution,
+      wall_map_use_config_ ? wall_map_config_path_.c_str() : wall_map_yaml_path_.c_str());
+  }
+
+  bool isValidObstacleInMap(const geometry_msgs::msg::Point & obstacle_in_map) const
+  {
+    if (!detector_.isObstacleWithinWallPCL(obstacle_in_map)) {
+      return false;
+    }
+
+    if (!wall_map_enabled_ || !static_wall_map_.has_map()) {
+      return true;
+    }
+
+    const auto is_wall = static_wall_map_.is_wall_at(obstacle_in_map.x, obstacle_in_map.y);
+    if (!is_wall.has_value()) {
+      return !wall_map_reject_out_of_map_;
+    }
+
+    return !is_wall.value();
+  }
+
   // ===== members =====
   // pubs
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr   static_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr            dynamic_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr   obj_flag_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr dbscan_vis_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr aligned_history_markers_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr      current_scan_pub_;
@@ -1038,26 +1365,59 @@ private:
   bool   use_weighted_median_{false};
   bool   only_static_{false};
 
-  // params/state (static wall map filtering)
-  bool wall_map_enable_{true};
-  bool wall_map_unknown_occupied_{true};
-  bool wall_map_loaded_{false};
-  int wall_map_occupied_threshold_{50};
-  double wall_map_filter_radius_{0.10};
+  // params (static wall-map filtering)
+  bool wall_map_enabled_{true};
+  bool wall_map_use_config_{true};
+  std::string wall_map_config_path_{"config.yaml"};
   std::string wall_map_yaml_path_{"0120.yaml"};
-  std::unique_ptr<wall_map::StaticWallMap> wall_map_;
+  bool wall_map_unknown_occupied_{true};
+  int wall_map_occupied_threshold_{50};
+  bool wall_map_reject_out_of_map_{false};
 
   // params (dynamic/static classification)
   double dyn_match_gate_{0.6};
-  int    dyn_min_history_frames_{3};
+  int    dyn_min_history_frames_{2};
   double dyn_static_thresh_{0.10};
   double dyn_dynamic_thresh_{0.30};
+  double dyn_unknown_hold_sec_{1.2};
+  double dyn_unknown_hold_gate_{0.8};
+  bool dyn_smoothing_enable_{true};
+  double dyn_smoothing_gate_{0.7};
+  double dyn_smoothing_max_age_sec_{1.0};
+  double dyn_static_memory_max_age_sec_{60.0};
+  int dyn_dynamic_confirm_frames_{2};
+  int dyn_static_confirm_frames_{2};
+  bool dyn_use_icp_aligned_history_{false};
+  int dyn_static_to_dynamic_confirm_frames_{8};
+  double dyn_static_lock_break_dist_{0.35};
+  int obj_flag_static_confirm_frames_{2};
+  int obj_flag_dynamic_confirm_frames_{2};
+  int obj_flag_static_count_{0};
+  int obj_flag_dynamic_count_{0};
+
+  struct DynamicLabelMemory {
+    geometry_msgs::msg::Point point;
+    rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
+  };
+  std::vector<DynamicLabelMemory> dynamic_label_memory_;
+
+  struct LabelSmoothingMemory {
+    geometry_msgs::msg::Point point;
+    rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
+    int label{0};
+    int pending_label{0};
+    int pending_count{0};
+    geometry_msgs::msg::Point static_anchor;
+    bool has_static_anchor{false};
+  };
+  std::vector<LabelSmoothingMemory> label_smoothing_memory_;
 
   // SINGLE manager
   MapManager map_manager_;
 
   // helpers
   DynamicObjectDetector detector_;
+  wall_map::StaticWallMap static_wall_map_;
 
   // ICP
   bool   icp_enable_{true};

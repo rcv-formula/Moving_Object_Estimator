@@ -1,0 +1,24 @@
+carto_eskf_node:
+  ros__parameters:
+
+    # --- Measurement Noise (Cartographer /odom) ---
+    meas_sigma_pos: 0.03          # [m] 위치 표준편차 (Carto가 안정적이면 0.02~0.05)
+    meas_sigma_ang: 0.00872665    # [rad] 자세 표준편차 ≈ 0.5 deg
+
+    # --- EKF Gate & Adaptation ---
+    gate_prob: 0.9973             # 게이팅 확률 (≈3σ)
+    adapt_scale: 10.0             # 게이트 초과 시 R 배수 확장 (10배 가중 낮춤)
+
+    # --- Jump Reject / Reinitialize ---
+    jump_reject_pos_norm: 1.5     # [m] 순간 튐(단발성) 무시 임계값
+    reinit_on_jump: true          # [bool] 큰 튐 시 /odom 기준으로 재초기화
+    reinit_pos_thresh: 3.0        # [m] 재초기화 임계값
+
+    # --- IMU Noise Parameters (AirIMU 보정 후 잔여 노이즈) ---
+    noise_acc: 0.6                # [m/s^2/sqrt(Hz)]
+    noise_gyr: 0.02               # [rad/s/sqrt(Hz)]
+    noise_ba:  0.01               # [m/s^2/sqrt(Hz)]
+    noise_bg:  0.001              # [rad/s/sqrt(Hz)]
+
+    # --- 기타 ---
+    use_sim_time: false           # 시뮬레이터(rosbag) 사용 시 true로 변경

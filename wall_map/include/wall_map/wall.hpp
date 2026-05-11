@@ -1,5 +1,6 @@
 #pragma once
 
+#include <geometry_msgs/msg/quaternion.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 
 #include <cstdint>
@@ -44,6 +45,7 @@ private:
   static bool parse_yaml(const std::string & yaml_path, map_yaml & out);
   static bool read_pgm(
     const std::string & pgm_path, int & width, int & height, std::vector<uint8_t> & pixels);
+  static std::string resolve_config_path(const std::string & config_path);
   static std::string resolve_yaml_path(const std::string & yaml_path);
   static std::string resolve_image_path(const std::string & yaml_path, const std::string & image_field);
   static double yaw_from_quaternion(const geometry_msgs::msg::Quaternion & q);

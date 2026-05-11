@@ -1,0 +1,10 @@
+airio_imu_odometry:
+  ros__parameters:
+    airimu_root: ""
+    airimu_ckpt: ""
+    airimu_conf: ""
+    airimu_seqlen: 100
+    airimu_stride: 5           # 5샘플마다만 추론
+    publish_rate: 30.0         # 퍼블리시는 30Hz 고정
+    use_fp16: true             # CUDA일 때 반정밀도
+    device: "cuda"

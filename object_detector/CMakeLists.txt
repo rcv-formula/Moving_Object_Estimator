@@ -19,6 +19,7 @@ include_directories(${MPI_C_INCLUDE_DIRS} ${MPI_CXX_INCLUDE_DIRS})
 
 # --- ament & ROS deps ---
 find_package(ament_cmake REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(rosidl_default_runtime REQUIRED)
 
@@ -80,8 +81,9 @@ add_dependencies(scan_processor_node ${PROJECT_NAME}__rosidl_typesupport_cpp)  #
 # 2) obstacle_detector_node
 add_executable(obstacle_detector_node src/obstacle_detector_node.cpp)
 ament_target_dependencies(obstacle_detector_node
-  rclcpp geometry_msgs nav_msgs visualization_msgs
-  pcl_conversions tf2_ros tf2_geometry_msgs wall_map
+  rclcpp ament_index_cpp geometry_msgs nav_msgs visualization_msgs
+  pcl_conversions tf2_ros tf2_geometry_msgs
+  wall_map
 )
 target_link_libraries(obstacle_detector_node object_detector_headers ${PCL_LIBRARIES} yaml-cpp)
 rosidl_target_interfaces(obstacle_detector_node ${PROJECT_NAME} "rosidl_typesupport_cpp")
@@ -117,17 +119,16 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/ DESTINATION include)
-install(DIRECTORY launch config track DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch config track rviz DESTINATION share/${PROJECT_NAME})
 
 # --- export: 런타임에 필요한 훅/경로 노출 ---
 ament_export_include_directories(include ${PCL_INCLUDE_DIRS})
 ament_export_dependencies(
   rosidl_default_runtime   # ★ 메시지 런타임 의존성 내보내기
-  rclcpp std_msgs sensor_msgs geometry_msgs nav_msgs
+  rclcpp ament_index_cpp std_msgs sensor_msgs geometry_msgs nav_msgs
   visualization_msgs message_filters
   tf2 tf2_ros tf2_geometry_msgs
-  wall_map
-  PCL pcl_conversions Eigen3
+  PCL pcl_conversions Eigen3 wall_map yaml-cpp
 )
 
 ament_package()

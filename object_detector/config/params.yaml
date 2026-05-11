@@ -7,7 +7,7 @@ scan_processor_node:
     scan_angle_max: 2.35619         # (rad) 스캔 데이터에서 고려할 최대 각도 (π/2 ≒ 1.5708 rad)
 
     # DBSCAN 클러스터링 관련 파라미터
-    min_cluster_points: 6        # (개) DBSCAN 클러스터링 시 하나의 클러스터로 인식하기 위한 최소 점 개수
+    min_cluster_points: 4        # (개) DBSCAN 클러스터링 시 하나의 클러스터로 인식하기 위한 최소 점 개수
     dbscan_epsilon: 0.1           # (m) 두 점 사이의 최대 거리 기준 (eps 값)
     dbscan_max_points: 100         # (개) DBSCAN 클러스터링 시 하나의 클러스터로 인식하기 위한 최대 점 개수
 
@@ -25,21 +25,39 @@ scan_processor_node:
     sor_mean_k: 8
     sor_stddev_mul: 2.0
     window_seconds: 0.25
+    odom_topic: "/odom"
+    use_latest_odom: true
 
 obstacle_detector_node:
   ros__parameters:
     dbscan_eps: 0.25                # (m) DBSCAN 함수에서 두 점이 서로 인접하다고 판단하는 최대 거리(증가시 클러스터 크기가 더 커짐)
-    dbscan_min_points: 5           # (개수) DBSCAN에서 하나의 코어로 간주되기 위해 해당 반경 내에 있어야 하는 점 최소 개수 
+    dbscan_min_points: 3           # (개수) DBSCAN에서 하나의 코어로 간주되기 위해 해당 반경 내에 있어야 하는 점 최소 개수 
     use_weighted_median: true      # () weighted median값을 사용해서 클러스터 내의 대표점을 산출할 지 결정하는 파라미터
     kalman_process_noise: 0.2      # (m²/s²)칼말 필터의 예측 단계에서 시스템의 불확실성(증가시 필터가 측정치에 민감하게 반응, noise에 민감해져서 요동침)
     kalman_measurement_noise: 0.05  # (m², m²/s²) 칼만 필터의 업데이트 단계에서 측정치의 노이즈(불확실성)를 나타내는 값
     use_kalman_filter: true        # () kalman filter 적용 여부
     obstacle_timeout: 0.03          # (초) 이 시간동안 측정값이 없으면 장애물 없음으로 간주
 
-    track_csv_path: "/home/rcv/object_detector/track/0120_track.csv"
-    # track_csv_path: "/root/moving_object_estimator_ws/object_detector/track/day1_track.csv"
+    icp:
+      enable: true
+      viz:
+        enable: false
+      max_history_for_icp: 30
+      max_iterations: 2
+
+    track_csv_path: "/home/symoon/object_path/object_detector/track/0120_track.csv"
+    # track_csv_path: "/home/symoon/object_path/object_detector/track/day1_track.csv"
     track_csv_has_header: true
-    only_static: true
+    only_static: false
+
+    wall_map:
+      enable: true
+      use_config: true
+      config_path: "/home/symoon/object_path/wall_map/config/config.yaml"
+      yaml_path: "/home/symoon/object_path/wall_map/maps/0120.yaml"
+      unknown_occupied: true
+      occupied_threshold: 50
+      reject_out_of_map: false
 
     wall_map:
       enable: true
@@ -50,6 +68,21 @@ obstacle_detector_node:
 
     dynamic_classification:
       match_gate: 0.6             # (m) 과거 프레임에서 현재 center와 같은 장애물 후보로 볼 최대 거리
-      min_history_frames: 3       # (개) 정적/동적을 판단하기 위한 최소 과거 매칭 프레임 수
-      static_thresh: 0.10         # (m) median 이동량이 이 값 이하면 정적
-      dynamic_thresh: 0.30        # (m) median 이동량이 이 값 이상이면 동적, 중간은 UNKNOWN
+      min_history_frames: 2       # (개) 정적/동적을 판단하기 위한 최소 과거 매칭 프레임 수
+      static_thresh: 0.10         # (m) 모든 매칭 이동량이 이 값 이하면 정적
+      dynamic_thresh: 0.15        # (m) 히스토리 중 이 값 이상 움직인 이력이 있으면 즉시 동적
+      unknown_hold_sec: 1.2       # (초) 최근 동적으로 본 물체 근처의 UNKNOWN은 이 시간 동안 동적으로 유지
+      unknown_hold_gate: 0.8      # (m) UNKNOWN을 최근 동적 물체와 같은 후보로 볼 최대 거리
+      smoothing_enable: true      # 상태 색이 한 프레임 튀지 않도록 같은 위치 후보의 판정을 짧게 누적
+      smoothing_gate: 0.7         # (m) 같은 물체로 볼 최대 거리
+      smoothing_max_age_sec: 1.0  # (초) 이 시간 이상 안 보인 smoothing track은 제거
+      static_memory_max_age_sec: 60.0 # (초) 정적 anchor는 시야에서 오래 빠져도 유지
+      dynamic_confirm_frames: 2   # (프레임) static/unknown에서 dynamic으로 바뀌기 전 필요한 연속 판정 수
+      static_confirm_frames: 3    # (프레임) dynamic/unknown에서 static으로 바뀌기 전 필요한 연속 판정 수
+      use_icp_aligned_history: false # true면 ICP 보정된 history로 분류, false면 odom 보정 history로 분류
+      static_to_dynamic_confirm_frames: 8 # 정적으로 고정된 후보가 동적으로 바뀌기 전 필요한 연속 판정 수
+      static_lock_break_dist: 0.35 # (m) 정적 anchor에서 이 거리 이내면 raw dynamic이어도 정적으로 유지
+
+    planner_bridge:
+      static_confirm_frames: 2    # local planner 회피 flag를 켜기 전 필요한 연속 static 판정 수
+      dynamic_confirm_frames: 2   # local planner 감속 flag를 켜기 전 필요한 연속 dynamic 판정 수

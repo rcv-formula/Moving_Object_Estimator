@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# === 스레드/BLAS 세팅: torch import 전에 환경변수/스레드 제한 ===
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+import rclpy
+from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.qos import qos_profile_sensor_data
+from collections import deque
+
+from sensor_msgs.msg import Imu
+from nav_msgs.msg import Odometry
+
+# 순서 주의: 위에서 env 세팅 후 numpy/torch import
+import numpy as np
+import threading
+import torch
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+torch.set_grad_enabled(False)  # 전역 autograd off
+import time
+
+from airio_imu_odometry.airimu_wrapper import AirIMUCorrector, ImuData
+from airio_imu_odometry.airio_wrapper import AirIOWrapper
+from airio_imu_odometry.ekf_wrapper import AirIOEKFWrapper, ImuSample, EkfParams
+
+class AirIoImuOdomNode(Node):
+    def __init__(self):
+        super().__init__('airio_imu_odometry')
+
+        # === 콜백 그룹 ===
+        self.cbgroup_imu   = MutuallyExclusiveCallbackGroup()
+
+        # --- Parameters ---
+        self.declare_parameter("airimu_root", "")
+        self.declare_parameter("airimu_ckpt", "")
+        self.declare_parameter("airimu_conf", "")
+        self.declare_parameter("airio_root", "")
+        self.declare_parameter("airio_ckpt", "")
+        self.declare_parameter("airio_conf", "")
+        self.declare_parameter("device", "cpu")
+        self.declare_parameter("airimu_seqlen", 100)
+        # 퍼블리시는 단순화(권장: 1), airio_every만 유지
+        self.declare_parameter("airio_every", 5)
+        self.declare_parameter("timming_logging_mode", False)
+        self.declare_parameter("timming_logging_outputpath", ".")
+        self.declare_parameter("odom_pub_rate", 50.0)  # 추가: /odom_airio 퍼블리시 주기(Hz)
+
+        airimu_root = self.get_parameter("airimu_root").get_parameter_value().string_value
+        airimu_ckpt = self.get_parameter("airimu_ckpt").get_parameter_value().string_value
+        airimu_conf = self.get_parameter("airimu_conf").get_parameter_value().string_value
+        airio_root  = self.get_parameter("airio_root").get_parameter_value().string_value
+        airio_ckpt  = self.get_parameter("airio_ckpt").get_parameter_value().string_value
+        airio_conf  = self.get_parameter("airio_conf").get_parameter_value().string_value
+        device_str  = self.get_parameter("device").get_parameter_value().string_value
+        self.seqlen = int(self.get_parameter("airimu_seqlen").get_parameter_value().integer_value)
+        self.airio_every = max(1, int(self.get_parameter("airio_every").get_parameter_value().integer_value))
+        self.TL_out_path = self.get_parameter("timming_logging_outputpath").get_parameter_value().string_value
+        self.TL_mode     = bool(self.get_parameter("timming_logging_mode").get_parameter_value().bool_value)
+        self.odom_pub_rate = float(self.get_parameter("odom_pub_rate").get_parameter_value().double_value)
+        self._pub_period = 1.0 / max(1e-6, self.odom_pub_rate)
+        self._last_pub_ts = 0.0  # 초 단위(ROS time)
+        
+        # --- Init gating ---
+        self.initialized = False
+        self.init_lock   = threading.Lock()
+        self.sample_lock = threading.Lock()  # add_sample 보호
+        self.prev_odom   = None
+        self.init_state  = {"pos": None, "rot": None, "vel": None, "stamp": None}
+
+        # === Cartographer 기반 재초기화 요청 버퍼 ===
+        self._realign_lock = threading.Lock()
+        self._realign_req = None  # dict | None  {pos, rot, vel, stamp}
+
+        # --- Modules ---
+        self.corrector = AirIMUCorrector(
+            airimu_root=airimu_root,
+            ckpt_path=airimu_ckpt, 
+            conf_path=airimu_conf,
+            device=device_str, 
+            seqlen=self.seqlen
+        )
+        self.airio = AirIOWrapper(
+            airio_root=airio_root,
+            ckpt_path=airio_ckpt,
+            conf_path=airio_conf,
+            device=device_str
+        )
+
+        self.ekf = AirIOEKFWrapper(
+            airio_root=airio_root,
+            use_repo=True,
+            params=EkfParams(gyro_noise=0.02, acc_noise=0.20)
+        )
+
+        # --- 상수/상태 ---
+        self.gravity = 9.81007
+
+        # --- Subs & Pubs ---
+        self._wait_for_sim_time(timeout_sec=5.0)
+        self.create_subscription(
+            Imu, '/imu/data_raw', self.imu_callback,
+            qos_profile_sensor_data, callback_group=self.cbgroup_imu
+        )
+        self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+
+        self.odom_pub     = self.create_publisher(Odometry, '/odom_airio', 10)
+        self.filtered_pub = self.create_publisher(Imu,      '/airimu_imu_data', 10)
+        self.imu_sec = None
+        self.imu_nanosec = None
+
+        # === IMU 콜백에서 처리 트리거 관련 상태 ===
+        self.samples_since_proc = 0
+        self.proc_lock = threading.Lock()  # 재진입 방지
+        self.proc_count = 0                # 퍼블리시/에어아이오 디커플링용 카운터
+
+        # AirIO 예측/불확실도 최근값 (airio_every>1일 때 재사용)
+        self.last_net_vel = np.zeros(3, dtype=float)
+        self.last_eta_v   = np.array([0.05, 0.05, 0.05], dtype=float)
+
+        if self.corrector.ready:
+            self.get_logger().info("AIR-IMU ready.")
+        else:
+            self.get_logger().warn("AIR-IMU in pass-through mode.")
+
+        if self.airio.ready:
+            self.get_logger().info("AIR-IO ready (velocity net).")
+        else:
+            self.get_logger().warn("AIR-IO in pass-through mode (velocity=0).")
+
+        self.get_logger().info("Waiting for /odom to initialize...")
+
+        try:
+            if getattr(self.ekf, "use_repo", False) and getattr(self.ekf, "repo_ekf", None) is not None:
+                self.get_logger().info(f"EKF backend: Air-IO repo -> {self.ekf.repo_ekf.__name__}")
+            else:
+                self.get_logger().warn("EKF backend: internal fallback (built-in 15-state EKF)")
+        except Exception as e:
+            self.get_logger().warn(f"EKF backend status check failed: {e}")
+
+        # --- Timming_Logging ---
+        self.airimu_step_t_deque = deque(maxlen=5000)
+        self.airio_network_step_t_deque = deque(maxlen=5000)
+        self.total_t_deque = deque(maxlen=5000)
+
+        # --- ZUPT/드리프트 방지용 상태 ---
+        # self.zupt_win_sec = 0.3
+        # self.gyro_thr     = 0.02
+        # self.acc_thr      = 0.15
+        self.deadband_ms  = 5.0
+        self.max_dt       = 0.2
+
+        self._imu_hist = deque(maxlen=2000)
+
+    # --- 내부 유틸 ---
+    def _wait_for_sim_time(self, timeout_sec: float = 5.0):
+        """
+        use_sim_time=True 가정. /clock 기반 시간이 유효해질 때까지 대기.
+        timeout_sec 내에 유효해지지 않으면 경고 로그만 남기고 진행한다.
+        """
+        start = time.time()
+        # now()==0 인 동안 대기
+        while rclpy.ok() and self.get_clock().now().nanoseconds == 0:
+            # 50ms 단위로 spin_once (콜백/파라미터 이벤트 처리)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if timeout_sec is not None and (time.time() - start) > timeout_sec:
+                self.get_logger().warn(
+                    f"Sim time(/clock) not available after {timeout_sec:.1f}s. "
+                    "Continuing anyway — check 'ros2 topic echo /clock' and rosbag '--clock'."
+                )
+                break
+    def _diff_velocity(self, prev: Odometry, curr: Odometry):
+        p0, p1 = prev.pose.pose.position, curr.pose.pose.position
+        t0 = prev.header.stamp.sec + prev.header.stamp.nanosec * 1e-9
+        t1 = curr.header.stamp.sec + curr.header.stamp.nanosec * 1e-9
+        dt = t1 - t0
+        if dt <= 0.0:
+            raise ValueError(f"non-positive dt: {dt}")
+        return [(p1.x - p0.x)/dt, (p1.y - p0.y)/dt, (p1.z - p0.z)/dt], t1
+
+    # def _is_stationary(self, now_stamp: float) -> bool:
+    #     if not self._imu_hist:
+    #         return False
+    #     win_start = now_stamp - self.zupt_win_sec
+    #     g_vals, a_vals = [], []
+    #     for t, g, a in self._imu_hist:
+    #         if t >= win_start:
+    #             g_vals.append(g); a_vals.append(a)
+    #     if len(g_vals) < 3:
+    #         return False
+    #     g_mean = float(np.mean(g_vals))
+    #     a_mean = float(np.mean(a_vals))
+    #     return (g_mean < self.gyro_thr) and (a_mean < self.acc_thr)
+
+    # === Callbacks ===
+    def odom_callback(self, msg: Odometry):
+        # 초기화(첫 2프레임) 로직
+        if not self.initialized:
+            with self.init_lock:
+                if self.initialized:
+                    return
+                if self.prev_odom is None:
+                    self.prev_odom = msg
+                    self.get_logger().info("First /odom buffered. Waiting next /odom for diff-velocity.")
+                    return
+                try:
+                    _, _ = self._diff_velocity(self.prev_odom, msg)
+                except Exception as e:
+                    self.prev_odom = msg
+                    self.get_logger().warn(f"diff-velocity failed; defer init. reason={e}")
+                    return
+
+                p = msg.pose.pose.position
+                q = msg.pose.pose.orientation
+                v = msg.twist.twist.linear
+                self.init_state = {
+                    "pos": [p.x, p.y, p.z],
+                    "rot": [q.x, q.y, q.z, q.w],
+                    "vel": [v.x, v.y, v.z],
+                    "stamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                }
+
+                try:
+                    if hasattr(self.airio, "set_init_state"):
+                        self.airio.set_init_state(self.init_state)
+                    if hasattr(self.corrector, "set_init_state"):
+                        self.corrector.set_init_state(self.init_state)
+                    if hasattr(self.ekf, "set_init_state"):
+                        self.ekf.set_init_state(self.init_state)
+                except Exception as e:
+                    self.get_logger().warn(f"set_init_state hook failed: {e}")
+
+                self.initialized = True
+                self.get_logger().info(f"/odom init pos={self.init_state['pos']} vel={self.init_state['vel']}")
+                return
+
+        # 초기화 이후에는 재정렬 요청
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        v = msg.twist.twist.linear
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        req = {
+            "pos": np.array([p.x, p.y, p.z], dtype=float),
+            "rot": np.array([q.x, q.y, q.z, q.w], dtype=float),
+            "vel": np.array([v.x, v.y, v.z], dtype=float),
+            "stamp": stamp
+        }
+        with self._realign_lock:
+            self._realign_req = req
+
+    def imu_callback(self, msg: Imu):
+        if not self.initialized:
+            return
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        self.imu_sec = msg.header.stamp.sec
+        self.imu_nanosec = msg.header.stamp.nanosec
+
+        imu_in = ImuData(
+            wx=msg.angular_velocity.x, wy=msg.angular_velocity.y, wz=msg.angular_velocity.z,
+            ax=msg.linear_acceleration.x, ay=msg.linear_acceleration.y, az=msg.linear_acceleration.z,
+            qx=msg.orientation.x, qy=msg.orientation.y, qz=msg.orientation.z, qw=msg.orientation.w,
+            stamp=stamp
+        )
+
+        # add_sample 보호 (최소 락 구간)
+        with self.sample_lock:
+            self.corrector.add_sample(imu_in)
+            self.airio.add_sample(imu_in)
+
+        # 정지 판정용 히스토리 기록(가벼운 계산) — 비활성화
+        # gx, gy, gz = msg.angular_velocity.x, msg.angular_velocity.y, msg.angular_velocity.z
+        # ax, ay, az = msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z
+        # gyro_norm = float(np.linalg.norm([gx, gy, gz]))
+        # acc_norm  = float(np.linalg.norm([ax, ay, az]) - self.gravity)
+        # self._imu_hist.append((stamp, gyro_norm, abs(acc_norm)))
+
+        # ====== seqlen 샘플마다 처리 트리거 ======
+        self.samples_since_proc += 1
+        if self.samples_since_proc >= max(1, self.seqlen):
+            # 재진입 방지: 바쁘면 스킵하고 다음 기회에 처리
+            if self.proc_lock.acquire(False):
+                try:
+                    self._process_once()
+                finally:
+                    self.samples_since_proc = 0
+                    self.proc_lock.release()
+        else:
+            # seqlen 미만일 때는 EKF를 즉시 propagate + 바로 publish 
+            try:
+                # AIR-IMU가 준비되기 전까지는 최소 보정치로 EKF 예측
+                wx, wy, wz, axc, ayc, azc = self.corrector.fallback_correct_vals(imu_in)
+            except Exception:
+                # 혹시 보정 접근 실패하면 원시값 사용
+                wx, wy, wz, axc, ayc, azc = imu_in.wx, imu_in.wy, imu_in.wz, imu_in.ax, imu_in.ay, imu_in.az
+    
+            try:
+                self.ekf.add_imu(ImuSample(
+                    wx=float(wx), wy=float(wy), wz=float(wz),
+                    ax=float(axc), ay=float(ayc), az=float(azc),
+                    stamp=float(stamp)
+                ))
+            except Exception as e:
+                self.get_logger().warn(f"EKF propagate (light) failed: {e}")
+                return
+    
+            # AIR-IO 업데이트/보정 없이, EKF 상태를 즉시 퍼블리시
+            self._publish_ekf_state_if_due()
+
+    # === 타이머 대신 호출되는 처리 본문 ===
+    
+    def _process_once(self):
+        if not self.initialized:
+            return
+
+        self.proc_count += 1  # 디커플링 카운터
+        t0 = time.time()
+
+        # 최신 보정값
+        imu_out = self.corrector.correct_latest()
+        if imu_out is None:
+            return
+        airimu_step_t = time.time() - t0
+
+        # === 재정렬 요청 반영 (통합기 제거된 버전: EKF/모듈만 리셋) ===
+        with self._realign_lock:
+            req = self._realign_req
+            self._realign_req = None
+        if req is not None:
+            try:
+                self.init_state = {
+                    "pos": req["pos"].tolist(),
+                    "rot": req["rot"].tolist(),
+                    "vel": req["vel"].tolist(),
+                    "stamp": req["stamp"]
+                }
+                # EKF/모듈 초기화만 갱신
+                if hasattr(self.ekf, "set_init_state"):
+                    self.ekf.set_init_state(self.init_state)
+                if hasattr(self.airio, "set_init_state"):
+                    self.airio.set_init_state(self.init_state)
+                if hasattr(self.corrector, "set_init_state"):
+                    self.corrector.set_init_state(self.init_state)
+            except Exception as e:
+                self.get_logger().error(f"Realign failed: {e}")
+
+        # === EKF PROPAGATION (보정 IMU 사용) ===
+        try:
+            self.ekf.add_imu(ImuSample(
+                wx=float(imu_out.wx), wy=float(imu_out.wy), wz=float(imu_out.wz),
+                ax=float(imu_out.ax), ay=float(imu_out.ay), az=float(imu_out.az),
+                stamp=float(imu_out.stamp)
+            ))
+        except Exception as e:
+            self.get_logger().warn(f"EKF propagate failed: {e}")
+
+        # === AirIO 속도 예측 — 디커플링: 일부 호출 스킵(정지 판정 없음) ===
+        # stationary = self._is_stationary(imu_out.stamp)
+        t2 = time.time()
+        # run_airio = (self.proc_count % self.airio_every == 0) and (not stationary)
+        run_airio = (self.proc_count % self.airio_every == 0)
+        if run_airio:
+            # EKF 추정 자세 사용
+            cur_rot_ekf = np.asarray(self.ekf.get_state()["rot"], dtype=float)
+            airio_out = self.airio.predict_velocity(cur_rot_ekf)
+
+            # vel + eta_v 파싱 (dict/tuple 호환)
+            if isinstance(airio_out, dict):
+                net_vel = np.asarray(airio_out.get("vel", (0.0, 0.0, 0.0)), dtype=float)
+                eta_v   = np.asarray(airio_out.get("eta_v", (0.05, 0.05, 0.05)), dtype=float)
+            else:
+                net_vel = np.asarray(airio_out, dtype=float)
+                eta_v   = np.asarray((0.05, 0.05, 0.05), dtype=float)
+
+            self.last_net_vel = net_vel
+            self.last_eta_v   = eta_v
+        else:
+            net_vel = self.last_net_vel
+        airio_network_step_t = time.time() - t2
+
+        # 데드밴드
+        if np.linalg.norm(net_vel) * 1000.0 < self.deadband_ms:
+            net_vel = np.zeros(3, dtype=float)
+            self.last_net_vel = net_vel
+
+        # === EKF UPDATE (바디 프레임 속도 + R_meas=diag(eta_v^2)) — 정지 조건 제거 ===
+        # if run_airio and not stationary:
+        if run_airio:
+            try:
+                eta_v = getattr(self, "last_eta_v", np.array([0.05, 0.05, 0.05], dtype=float))
+                R_meas = np.diag((eta_v ** 2.0).tolist())
+                self.ekf.update_velocity_body(tuple(net_vel.tolist()), R_meas)
+            except Exception as e:
+                self.get_logger().warn(f"EKF update (velocity) failed: {e}")
+
+        total_t = time.time() - t0
+
+        if self.TL_mode and total_t <= 0.1:
+            self.airimu_step_t_deque.append(airimu_step_t)
+            self.airio_network_step_t_deque.append(airio_network_step_t)
+            self.total_t_deque.append(total_t)
+
+        # republish IMU (보정된 최신 샘플)
+        imu_msg = Imu()
+        imu_msg.header.stamp.sec = self.imu_sec
+        imu_msg.header.stamp.nanosec = self.imu_nanosec
+        imu_msg.header.frame_id = "base_link"
+        imu_msg.angular_velocity.x = float(imu_out.wx)
+        imu_msg.angular_velocity.y = float(imu_out.wy)
+        imu_msg.angular_velocity.z = float(imu_out.wz)
+        imu_msg.linear_acceleration.x = float(imu_out.ax)
+        imu_msg.linear_acceleration.y = float(imu_out.ay)
+        imu_msg.linear_acceleration.z = float(imu_out.az)
+        imu_msg.orientation.x = float(imu_out.qx)
+        imu_msg.orientation.y = float(imu_out.qy)
+        imu_msg.orientation.z = float(imu_out.qz)
+        imu_msg.orientation.w = float(imu_out.qw)
+        self.filtered_pub.publish(imu_msg)
+
+        # publish odom (frame=map) — EKF 상태 직결
+        self._publish_ekf_state()
+
+    def _now_ros_time_sec(self) -> float:
+        # ROS 시뮬레이션 시간(/clock) 사용 시에도 안전하게 초 단위 반환
+        nsec = self.get_clock().now().nanoseconds
+        return float(nsec) * 1e-9
+    
+    def _publish_ekf_state_if_due(self):
+        now = self._now_ros_time_sec()
+        if (now - self._last_pub_ts) < self._pub_period:
+            return
+        self._last_pub_ts = now
+        self._publish_ekf_state()
+
+    def _publish_ekf_state(self):
+        s = self.ekf.get_state()
+        pos = np.asarray(s["pos"], dtype=float)
+        rot = np.asarray(s["rot"], dtype=float)
+        vel = np.asarray(s["vel"], dtype=float)
+    
+        odom = Odometry()
+        odom.header.stamp = self.get_clock().now().to_msg()
+        odom.header.frame_id = "map"
+        odom.child_frame_id = "base_link"
+        odom.pose.pose.position.x = float(pos[0])
+        odom.pose.pose.position.y = float(pos[1])
+        odom.pose.pose.position.z = float(pos[2])
+        odom.pose.pose.orientation.x = float(rot[0])
+        odom.pose.pose.orientation.y = float(rot[1])
+        odom.pose.pose.orientation.z = float(rot[2])
+        odom.pose.pose.orientation.w = float(rot[3])
+        odom.twist.twist.linear.x = float(vel[0])
+        odom.twist.twist.linear.y = float(vel[1])
+        odom.twist.twist.linear.z = float(vel[2])
+        self.odom_pub.publish(odom)
+        
+    # (옵션) 타이밍 저장
+    def save_timings(self):
+        import matplotlib.pyplot as plt  # 필요 시에만 임포트(지연 로딩)
+        timings = {
+            "AIR-IMU": list(self.airimu_step_t_deque),
+            "AIR-IO Network": list(self.airio_network_step_t_deque),
+            "Total": list(self.total_t_deque),
+        }
+        outdir = os.path.dirname(self.TL_out_path) or "."
+        prefix = os.path.splitext(os.path.basename(self.TL_out_path))[0] or "timings"
+        os.makedirs(outdir, exist_ok=True)
+        for name, values in timings.items():
+            plt.figure(figsize=(8, 4))
+            ms = [v * 1000 for v in values]
+            plt.plot(ms, marker='o', markersize=2, linewidth=0.7, label=name)
+            if values:
+                avg = sum(values) / len(values) * 1000.0
+                plt.axhline(avg, linestyle='--', label=f"avg={avg:.3f}ms")
+                plt.axhline(min(values) * 1000.0, linestyle=':', label=f"min={min(values)*1000:.3f}ms")
+                plt.axhline(max(values) * 1000.0, linestyle=':', label=f"max={max(values)*1000:.3f}ms")
+            plt.ylabel("millisecond"); plt.xlabel("#"); plt.title(name)
+            plt.legend(loc="upper right"); plt.grid(True)
+            safe = name.replace(" ", "_").replace("/", "_")
+            plt.tight_layout(); plt.savefig(os.path.join(outdir, f"{prefix}_{safe}.png"), dpi=130); plt.close()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = AirIoImuOdomNode()
+    try:
+        rclpy.spin(node)  # 싱글 스레드
+    except KeyboardInterrupt:
+        if node.TL_mode:
+            node.save_timings()
+    finally:
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

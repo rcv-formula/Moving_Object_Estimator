@@ -59,6 +59,8 @@ public:
     this->declare_parameter<double>("dynamic_wall_gap_factor", 1.5);
     this->declare_parameter<int>("sor_mean_k", 10);
     this->declare_parameter<double>("sor_stddev_mul", 2.0);
+    this->declare_parameter<std::string>("odom_topic", "/odom");
+    this->declare_parameter<bool>("use_latest_odom", true);
 
     // 파라미터 로드
     this->get_parameter("scan_range_min", scan_range_min_);
@@ -77,6 +79,8 @@ public:
     this->get_parameter("dynamic_wall_gap_factor", dynamic_wall_gap_factor_);
     this->get_parameter("sor_mean_k", sor_mean_k_);
     this->get_parameter("sor_stddev_mul", sor_stddev_mul_);
+    this->get_parameter("odom_topic", odom_topic_);
+    this->get_parameter("use_latest_odom", use_latest_odom_);
 
     // 퍼블리셔
     candidate_pub_     = this->create_publisher<geometry_msgs::msg::PointStamped>("/obstacle_candidates", 20);
@@ -91,18 +95,46 @@ public:
     rclcpp::SensorDataQoS sensor_qos;
     auto rmw_qos = sensor_qos.get_rmw_qos_profile();
 
-    scan_mf_sub_.subscribe(this, "/scan", rmw_qos);
-    odom_mf_sub_.subscribe(this, "/odom", rmw_qos);
+    if (use_latest_odom_) {
+      scan_sub_ = this->create_subscription<Laser>(
+        "/scan", rclcpp::SensorDataQoS(),
+        std::bind(&ScanProcessor::scanCallbackLatestOdom, this, std::placeholders::_1));
+      odom_sub_ = this->create_subscription<Odom>(
+        odom_topic_, rclcpp::SensorDataQoS(),
+        std::bind(&ScanProcessor::odomCallback, this, std::placeholders::_1));
+    } else {
+      scan_mf_sub_.subscribe(this, "/scan", rmw_qos);
+      odom_mf_sub_.subscribe(this, odom_topic_, rmw_qos);
 
-    sync_ = std::make_shared<message_filters::Synchronizer<ApproxPolicy>>(ApproxPolicy(1000), scan_mf_sub_, odom_mf_sub_);
-    sync_->registerCallback(std::bind(&ScanProcessor::syncCallback, this,
-                                      std::placeholders::_1, std::placeholders::_2));
+      sync_ = std::make_shared<message_filters::Synchronizer<ApproxPolicy>>(ApproxPolicy(1000), scan_mf_sub_, odom_mf_sub_);
+      sync_->registerCallback(std::bind(&ScanProcessor::syncCallback, this,
+                                        std::placeholders::_1, std::placeholders::_2));
+    }
   }
 
 private:
   // 동기화 콜백: LaserScan + Odom
   void syncCallback(const Laser::ConstSharedPtr& scan_msg,
                     const Odom::ConstSharedPtr& odom_msg)
+  {
+    processScanWithOdom(scan_msg, odom_msg);
+  }
+
+  void odomCallback(const Odom::ConstSharedPtr& odom_msg)
+  {
+    latest_odom_ = odom_msg;
+  }
+
+  void scanCallbackLatestOdom(const Laser::ConstSharedPtr& scan_msg)
+  {
+    if (!latest_odom_) {
+      return;
+    }
+    processScanWithOdom(scan_msg, latest_odom_);
+  }
+
+  void processScanWithOdom(const Laser::ConstSharedPtr& scan_msg,
+                           const Odom::ConstSharedPtr& odom_msg)
   {
     // --- /processed_odom: scan과 같은 timestamp로 발행 ---
     {
@@ -415,6 +447,9 @@ private:
   message_filters::Subscriber<Laser> scan_mf_sub_;
   message_filters::Subscriber<Odom>  odom_mf_sub_;
   std::shared_ptr<message_filters::Synchronizer<ApproxPolicy>> sync_;
+  rclcpp::Subscription<Laser>::SharedPtr scan_sub_;
+  rclcpp::Subscription<Odom>::SharedPtr odom_sub_;
+  Odom::ConstSharedPtr latest_odom_;
 
   // 퍼블리셔
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr      candidate_pub_;
@@ -434,6 +469,8 @@ private:
   double far_obstacle_distance_threshold_; int far_obstacle_min_points_;
   double dynamic_wall_gap_factor_;
   int    sor_mean_k_; double sor_stddev_mul_;
+  std::string odom_topic_{"/odom"};
+  bool use_latest_odom_{true};
 };
 
 int main(int argc, char **argv)

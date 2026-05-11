@@ -1,0 +1,29 @@
+services:
+  humble_ws:
+    build:
+      context: .
+      dockerfile: containers/Dockerfile.jetson
+    image: mos:jetson
+    container_name: mos_jetson
+
+    gpus: all
+    runtime: nvidia
+    privileged: true
+    network_mode: host
+    ipc: host
+    shm_size: "1g"
+
+    environment:
+      - DISPLAY=${DISPLAY}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - QT_X11_NO_MITSHM=1
+
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /dev/video0:/dev/video0
+      - .:/root/moving_object_estimator_ws
+    working_dir: /root/moving_object_estimator_ws
+
+    restart: unless-stopped
+    command: ["/bin/bash", "-c", "tail -f /dev/null"]

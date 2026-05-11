@@ -9,8 +9,8 @@
  *  - publishAlignedFramesMarkers(aligned_frames, frame_id, stamp, pub, point_scale, alpha):
  *      정렬된 과거 오브젝트 프레임들을 MarkerArray로 시각화
  *  - classifyDynamicByFootprint(target, aligned_frames, static_thresh, min_history_frames, match_gate, exclude_current, dynamic_thresh, out_footprint, out_span):
- *      현재 타깃과 과거 프레임별 nearest center의 median 이동량으로 동적/정적을 분류.
- *      유효 매칭 프레임이 부족하거나 static/dynamic threshold 사이면 UNKNOWN.
+ *      현재 타깃과 과거 프레임별 nearest center의 이동량 분포로 동적/정적을 분류.
+ *      유효 매칭 프레임이 부족하거나 판단 경계에 있으면 UNKNOWN.
  *  - visualizeFootprint(footprint, label, frame_id, id, stamp, pub):
  *      footprint를 MarkerArray로 시각화
  */
@@ -50,7 +50,7 @@ public:
 
       std::ifstream ifs(csv_path);
       if (!ifs.is_open()) {
-        RCLCPP_ERROR(rclcpp::get_logger("DynamicObjectDetector"),
+        RCLCPP_DEBUG(rclcpp::get_logger("DynamicObjectDetector"),
                     "Failed to open CSV (PCL): %s", csv_path.c_str());
         track_cloud_.reset();
         kdtree_pcl_.reset();
@@ -80,7 +80,7 @@ public:
         ok &= to_double(cols[2], w);
 
         if (!ok || std::isnan(x) || std::isnan(y) || std::isnan(w)) {
-          RCLCPP_WARN(rclcpp::get_logger("DynamicObjectDetector"),
+          RCLCPP_DEBUG(rclcpp::get_logger("DynamicObjectDetector"),
                       "CSV line %zu parse failed (x/y/w). Skip.", line_no);
           ++line_no; continue;
         }
@@ -96,7 +96,7 @@ public:
       }
 
       kdtree_pcl_->setInputCloud(track_cloud_);
-      RCLCPP_INFO(rclcpp::get_logger("DynamicObjectDetector"),
+      RCLCPP_DEBUG(rclcpp::get_logger("DynamicObjectDetector"),
                   "Loaded %zu center points (PCL) and built KD-Tree.",
                   track_cloud_->size());
       return true;
@@ -167,7 +167,7 @@ public:
   inline bool isObstacleWithinWallPCL(const geometry_msgs::msg::Point& obstacle_in_map) const
   {
     if (!track_cloud_ || !kdtree_pcl_ || track_cloud_->empty()) {
-      RCLCPP_WARN(rclcpp::get_logger("DynamicObjectDetector"),
+      RCLCPP_DEBUG(rclcpp::get_logger("DynamicObjectDetector"),
                   "Track CSV (PCL) not loaded. Treat obstacle as valid.");
       return true; // 인덱스가 없으면 무효 판정 불가 → 유효 처리
     }
@@ -182,13 +182,12 @@ public:
 
     const int found = kdtree_pcl_->nearestKSearch(query, 1, knn_idx, knn_d2);
     if (found <= 0 || knn_idx[0] < 0 || static_cast<size_t>(knn_idx[0]) >= track_cloud_->size()) {
-      RCLCPP_WARN(rclcpp::get_logger("DynamicObjectDetector"),
+      RCLCPP_DEBUG(rclcpp::get_logger("DynamicObjectDetector"),
                   "PCL KD-Tree query failed. Treat obstacle as valid.");
       return true;
     }
 
     const pcl::PointXYZI& nn = (*track_cloud_)[knn_idx[0]];
-    std::cout << knn_idx[0] <<"\n";
     const double d_center_obs = std::sqrt(static_cast<double>(knn_d2[0]));
     const double wall_dist    = static_cast<double>(nn.intensity);
 
@@ -281,7 +280,8 @@ public:
    *
    * aligned_frames는 현재 프레임을 포함하지 않는 과거 프레임 목록이다.
    * 각 과거 프레임에서 target과 가장 가까운 center 1개만 사용하고, match_gate 밖이면 버린다.
-   * 유효 매칭 수가 부족하면 UNKNOWN, median 이동량이 작으면 STATIC, 크면 DYNAMIC이다.
+   * 유효 매칭 수가 부족하면 UNKNOWN, median 이동량이 작으면 STATIC,
+   * 여러 프레임에서 충분히 멀리 움직였으면 DYNAMIC이다.
    */
   int classifyDynamicByFootprint(
       const geometry_msgs::msg::Point& target_in_current,
@@ -351,9 +351,13 @@ public:
 
     std::sort(dist_vec.begin(), dist_vec.end());
     const double median = dist_vec[dist_vec.size() / 2];
+    const int dynamic_hits = static_cast<int>(std::count_if(
+      dist_vec.begin(), dist_vec.end(),
+      [dynamic_thresh](double d) { return d >= dynamic_thresh; }));
 
-    if (median <= static_thresh) return STATIC;
+    if (dynamic_hits >= std::max(2, min_history_frames)) return DYNAMIC;
     if (median >= dynamic_thresh) return DYNAMIC;
+    if (median <= static_thresh && dynamic_hits == 0) return STATIC;
 
     return UNKNOWN;
   }
@@ -383,7 +387,7 @@ public:
       pts.scale.x = 0.06; pts.scale.y = 0.06; pts.scale.z = 0.06;
 
       if (dyn_label == DYNAMIC) {         // 빨강
-        pts.color.r = 1.0f; pts.color.g = 0.1f; pts.color.b = 0.1f; pts.color.a = 0.95f;
+        pts.color.r = 1.0f; pts.color.g = 0.0f; pts.color.b = 0.0f; pts.color.a = 0.95f;
       } else if (dyn_label == STATIC) {   // 파랑
         pts.color.r = 0.1f; pts.color.g = 0.4f; pts.color.b = 1.0f; pts.color.a = 0.95f;
       } else {                            // UNKNOWN = 노랑

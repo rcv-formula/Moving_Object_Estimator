@@ -47,7 +47,7 @@ public:
         "/obstacle_candidates", 10,
         std::bind(&TimestampComparatorNode::candidateCallback, this, std::placeholders::_1));
 
-    RCLCPP_INFO(this->get_logger(), "Timestamp Comparator Node Initialized");
+    RCLCPP_DEBUG(this->get_logger(), "Timestamp Comparator Node Initialized");
   }
 
 private:
