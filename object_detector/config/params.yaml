@@ -21,7 +21,7 @@ scan_processor_node:
     far_obstacle_distance_threshold: 4.5  # (m) 센서로부터의 거리가 이 값 이상이면 '멀리 있는 장애물'로 판단
     far_obstacle_min_points: 4            # (개) 멀리 있는 장애물로 인식하기 위한 최소 스캔 점 개수
     dynamic_wall_gap_factor: 2.8           # (가중치) 먼 거리 벽 그룹화를 위한 동적 임계값 배율
-    
+
     sor_mean_k: 8
     sor_stddev_mul: 2.0
     window_seconds: 0.25
@@ -31,7 +31,7 @@ scan_processor_node:
 obstacle_detector_node:
   ros__parameters:
     dbscan_eps: 0.25                # (m) DBSCAN 함수에서 두 점이 서로 인접하다고 판단하는 최대 거리(증가시 클러스터 크기가 더 커짐)
-    dbscan_min_points: 3           # (개수) DBSCAN에서 하나의 코어로 간주되기 위해 해당 반경 내에 있어야 하는 점 최소 개수 
+    dbscan_min_points: 3           # (개수) DBSCAN에서 하나의 코어로 간주되기 위해 해당 반경 내에 있어야 하는 점 최소 개수
     use_weighted_median: true      # () weighted median값을 사용해서 클러스터 내의 대표점을 산출할 지 결정하는 파라미터
     kalman_process_noise: 0.2      # (m²/s²)칼말 필터의 예측 단계에서 시스템의 불확실성(증가시 필터가 측정치에 민감하게 반응, noise에 민감해져서 요동침)
     kalman_measurement_noise: 0.05  # (m², m²/s²) 칼만 필터의 업데이트 단계에서 측정치의 노이즈(불확실성)를 나타내는 값
@@ -58,13 +58,6 @@ obstacle_detector_node:
       unknown_occupied: true
       occupied_threshold: 50
       reject_out_of_map: false
-
-    wall_map:
-      enable: true
-      yaml_path: "0120.yaml"
-      unknown_occupied: true
-      occupied_threshold: 50
-      filter_radius: 0.10
 
     dynamic_classification:
       match_gate: 0.6             # (m) 과거 프레임에서 현재 center와 같은 장애물 후보로 볼 최대 거리
