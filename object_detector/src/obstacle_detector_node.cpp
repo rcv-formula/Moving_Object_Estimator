@@ -797,6 +797,17 @@ private:
             return best_idx;
           };
 
+        const auto transition_confirm_frames =
+          [&](Label current_label, Label next_label) -> int {
+            int confirm_frames = (next_label == DYNAMIC) ?
+              std::max(1, dyn_dynamic_confirm_frames_) :
+              std::max(1, dyn_static_confirm_frames_);
+            if (current_label == STATIC && next_label == DYNAMIC) {
+              confirm_frames = std::max(confirm_frames, dyn_static_to_dynamic_confirm_frames_);
+            }
+            return confirm_frames;
+          };
+
         std::vector<bool> matched(label_smoothing_memory_.size(), false);
         for (size_t i = 0; i < centers.size(); ++i) {
           const auto p_map = transformLocalWithPose(centers[i], pose_used);
@@ -832,16 +843,24 @@ private:
             LabelSmoothingMemory memory;
             memory.point = p_map.point;
             memory.stamp = label_stamp;
-            memory.label = (raw_label == DYNAMIC) ? static_cast<int>(DYNAMIC) :
-              (locked_by_static_anchor ? static_cast<int>(STATIC) : static_cast<int>(UNKNOWN));
-            memory.pending_label = (raw_label == UNKNOWN) ? static_cast<int>(UNKNOWN) : static_cast<int>(raw_label);
-            memory.pending_count = (raw_label == UNKNOWN) ? 0 : 1;
+            memory.label = locked_by_static_anchor ? static_cast<int>(STATIC) : static_cast<int>(UNKNOWN);
+            memory.pending_label = static_cast<int>(UNKNOWN);
+            memory.pending_count = 0;
             if (locked_by_static_anchor) {
               memory.static_anchor = label_smoothing_memory_[locked_static_idx].static_anchor;
               memory.has_static_anchor = true;
-            } else if (memory.label == static_cast<int>(STATIC)) {
-              memory.static_anchor = p_map.point;
-              memory.has_static_anchor = true;
+            } else if (raw_label != UNKNOWN) {
+              memory.pending_label = static_cast<int>(raw_label);
+              memory.pending_count = 1;
+              if (memory.pending_count >= transition_confirm_frames(UNKNOWN, raw_label)) {
+                memory.label = static_cast<int>(raw_label);
+                memory.pending_label = static_cast<int>(UNKNOWN);
+                memory.pending_count = 0;
+                if (raw_label == STATIC) {
+                  memory.static_anchor = p_map.point;
+                  memory.has_static_anchor = true;
+                }
+              }
             }
             label_smoothing_memory_.push_back(memory);
             matched.push_back(true);
@@ -879,7 +898,7 @@ private:
               memory.pending_label = static_cast<int>(UNKNOWN);
               memory.pending_count = 0;
               continue;
-              }
+            }
           }
 
           if (raw_label != UNKNOWN && raw_label != static_cast<Label>(memory.label)) {
@@ -890,12 +909,8 @@ private:
               memory.pending_count = 1;
             }
 
-            int confirm_frames = (raw_label == DYNAMIC) ?
-              std::max(1, dyn_dynamic_confirm_frames_) :
-              std::max(1, dyn_static_confirm_frames_);
-            if (memory.label == static_cast<int>(STATIC) && raw_label == DYNAMIC) {
-              confirm_frames = std::max(confirm_frames, dyn_static_to_dynamic_confirm_frames_);
-            }
+            const int confirm_frames =
+              transition_confirm_frames(static_cast<Label>(memory.label), raw_label);
             if (memory.pending_count >= confirm_frames) {
               memory.label = static_cast<int>(raw_label);
               memory.pending_label = static_cast<int>(UNKNOWN);

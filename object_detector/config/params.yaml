@@ -21,7 +21,7 @@ scan_processor_node:
     far_obstacle_distance_threshold: 4.5  # (m) 센서로부터의 거리가 이 값 이상이면 '멀리 있는 장애물'로 판단
     far_obstacle_min_points: 4            # (개) 멀리 있는 장애물로 인식하기 위한 최소 스캔 점 개수
     dynamic_wall_gap_factor: 2.8           # (가중치) 먼 거리 벽 그룹화를 위한 동적 임계값 배율
-
+    
     sor_mean_k: 8
     sor_stddev_mul: 2.0
     window_seconds: 0.25
@@ -31,7 +31,7 @@ scan_processor_node:
 obstacle_detector_node:
   ros__parameters:
     dbscan_eps: 0.25                # (m) DBSCAN 함수에서 두 점이 서로 인접하다고 판단하는 최대 거리(증가시 클러스터 크기가 더 커짐)
-    dbscan_min_points: 3           # (개수) DBSCAN에서 하나의 코어로 간주되기 위해 해당 반경 내에 있어야 하는 점 최소 개수
+    dbscan_min_points: 3           # (개수) DBSCAN에서 하나의 코어로 간주되기 위해 해당 반경 내에 있어야 하는 점 최소 개수 
     use_weighted_median: true      # () weighted median값을 사용해서 클러스터 내의 대표점을 산출할 지 결정하는 파라미터
     kalman_process_noise: 0.2      # (m²/s²)칼말 필터의 예측 단계에서 시스템의 불확실성(증가시 필터가 측정치에 민감하게 반응, noise에 민감해져서 요동침)
     kalman_measurement_noise: 0.05  # (m², m²/s²) 칼만 필터의 업데이트 단계에서 측정치의 노이즈(불확실성)를 나타내는 값
@@ -63,18 +63,18 @@ obstacle_detector_node:
       match_gate: 0.6             # (m) 과거 프레임에서 현재 center와 같은 장애물 후보로 볼 최대 거리
       min_history_frames: 2       # (개) 정적/동적을 판단하기 위한 최소 과거 매칭 프레임 수
       static_thresh: 0.10         # (m) 모든 매칭 이동량이 이 값 이하면 정적
-      dynamic_thresh: 0.15        # (m) 히스토리 중 이 값 이상 움직인 이력이 있으면 즉시 동적
+      dynamic_thresh: 0.22        # (m) 히스토리 중 이 값 이상 움직인 이력이 있으면 동적 후보
       unknown_hold_sec: 1.2       # (초) 최근 동적으로 본 물체 근처의 UNKNOWN은 이 시간 동안 동적으로 유지
-      unknown_hold_gate: 0.8      # (m) UNKNOWN을 최근 동적 물체와 같은 후보로 볼 최대 거리
+      unknown_hold_gate: 0.55     # (m) UNKNOWN을 최근 동적 물체와 같은 후보로 볼 최대 거리
       smoothing_enable: true      # 상태 색이 한 프레임 튀지 않도록 같은 위치 후보의 판정을 짧게 누적
       smoothing_gate: 0.7         # (m) 같은 물체로 볼 최대 거리
       smoothing_max_age_sec: 1.0  # (초) 이 시간 이상 안 보인 smoothing track은 제거
       static_memory_max_age_sec: 60.0 # (초) 정적 anchor는 시야에서 오래 빠져도 유지
-      dynamic_confirm_frames: 2   # (프레임) static/unknown에서 dynamic으로 바뀌기 전 필요한 연속 판정 수
+      dynamic_confirm_frames: 3   # (프레임) static/unknown에서 dynamic으로 바뀌기 전 필요한 연속 판정 수
       static_confirm_frames: 3    # (프레임) dynamic/unknown에서 static으로 바뀌기 전 필요한 연속 판정 수
       use_icp_aligned_history: false # true면 ICP 보정된 history로 분류, false면 odom 보정 history로 분류
-      static_to_dynamic_confirm_frames: 8 # 정적으로 고정된 후보가 동적으로 바뀌기 전 필요한 연속 판정 수
-      static_lock_break_dist: 0.35 # (m) 정적 anchor에서 이 거리 이내면 raw dynamic이어도 정적으로 유지
+      static_to_dynamic_confirm_frames: 6 # 정적으로 고정된 후보가 동적으로 바뀌기 전 필요한 연속 판정 수
+      static_lock_break_dist: 0.33 # (m) 정적 anchor에서 이 거리 이내면 raw dynamic이어도 정적으로 유지
 
     planner_bridge:
       static_confirm_frames: 2    # local planner 회피 flag를 켜기 전 필요한 연속 static 판정 수
